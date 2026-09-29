@@ -1,3 +1,4 @@
+.claude/
 .venv/
 *.zip
 .DS_Store

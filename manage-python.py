@@ -1615,7 +1615,7 @@ def cmd_install(spec: str, paths: Paths, net: Network, triple: Optional[str] = N
     log(_("CPython {version} installed; python and {alias} now run it")
         .format(version=build.version, alias=plan.alias_name(minor)))
     if paths.windows:
-        add_to_windows_user_path(paths)
+        add_to_windows_user_path(paths, now=now)
     path_notes(paths)
     return build.version
 
@@ -1660,31 +1660,74 @@ def _broadcast_environment_change() -> None:
         0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, ctypes.byref(result))
 
 
+REG_TYPE_NAMES = {REG_SZ: "REG_SZ", REG_EXPAND_SZ: "REG_EXPAND_SZ"}
+
+
+def write_path_backup(paths: Paths, previous: Optional[str], value_type: int,
+                      now: Optional[datetime] = None) -> Path:
+    """Save the user Path as it was, with its registry type, before the
+    manager changes it: path-backup-<UTC>.txt in the state directory."""
+    ensure_dir(paths.state_dir, paths.windows)
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    backup = paths.state_dir / f"path-backup-{moment.strftime('%Y%m%dT%H%M%SZ')}.txt"
+    text = (f"# HKCU\\Environment\\Path before {COMMAND} prepended {WINDOWS_BIN_ENTRY}\n"
+            f"saved: {utc_timestamp(moment)}\n"
+            f"type: {REG_TYPE_NAMES[value_type] if previous is not None else 'absent'}\n"
+            f"value: {previous or ''}\n")
+    atomic_write_text(backup, text, newline=_NEWLINE["cmd" if paths.windows else "posix"],
+                      windows=paths.windows)
+    return backup
+
+
 def add_to_windows_user_path(paths: Paths, registry=None,
-                             broadcast: Optional[Callable[[], None]] = None) -> bool:
+                             broadcast: Optional[Callable[[], None]] = None,
+                             now: Optional[datetime] = None) -> bool:
     """Prepend %LOCALAPPDATA%\\Programs to HKCU\\Environment Path, keeping its
-    value type, unless it is already there. Returns True if Path changed."""
+    value type, unless it is already there. A change is visible and
+    reversible: the previous value is backed up first, the change is
+    announced with how to undo it, and it is logged as a "path" action.
+    When the entry is already present nothing is printed or logged. A failure
+    is logged and reported but does not fail the install. Returns True if
+    Path changed."""
     if sandbox_mode():
         log(_("sandbox mode: the Windows user PATH is not changed"))
         return False
     if registry is None:
         import winreg as registry  # type: ignore[import-not-found,no-redef]
-    with registry.OpenKey(registry.HKEY_CURRENT_USER, "Environment", 0,
-                          registry.KEY_READ | registry.KEY_WRITE) as key:
-        try:
-            current, value_type = registry.QueryValueEx(key, "Path")
-        except FileNotFoundError:
-            current, value_type = "", registry.REG_EXPAND_SZ
-        if value_type not in (registry.REG_SZ, registry.REG_EXPAND_SZ):
-            raise ManagerError(_("HKCU\\Environment Path has an unexpected type; add {entry} by hand")
-                               .format(entry=WINDOWS_BIN_ENTRY))
-        updated = prepend_path_entry(current, value_type, paths.environ)
-        if updated is None:
-            return False
-        registry.SetValueEx(key, "Path", 0, value_type, updated)
-    (broadcast or _broadcast_environment_change)()
-    log(_("added {entry} to the start of your user PATH; open a new terminal to use it")
+    try:
+        with registry.OpenKey(registry.HKEY_CURRENT_USER, "Environment", 0,
+                              registry.KEY_READ | registry.KEY_WRITE) as key:
+            try:
+                current, value_type = registry.QueryValueEx(key, "Path")
+                previous: Optional[str] = current
+            except FileNotFoundError:
+                current, value_type, previous = "", registry.REG_EXPAND_SZ, None
+            if value_type not in (registry.REG_SZ, registry.REG_EXPAND_SZ):
+                raise ManagerError(_("HKCU\\Environment\\Path has an unexpected registry type"))
+            updated = prepend_path_entry(current, value_type, paths.environ)
+            if updated is None:
+                return False
+            backup = write_path_backup(paths, previous, value_type, now)
+            registry.SetValueEx(key, "Path", 0, value_type, updated)
+    except (OSError, ManagerError) as error:
+        append_log(paths, "path", WINDOWS_BIN_ENTRY, f"failed: {error}", now)
+        log(_("warning: your user PATH was not changed: {error}. Add {entry} to it "
+              "yourself to run the manager's commands from any terminal")
+            .format(error=error, entry=WINDOWS_BIN_ENTRY))
+        return False
+    try:
+        (broadcast or _broadcast_environment_change)()
+    except (OSError, AttributeError) as error:
+        log(_("warning: could not tell Windows the environment changed ({error}); "
+              "sign out and in again if new terminals do not see it").format(error=error))
+    shown = paths.display(backup)
+    log(_("Added {entry} to the start of your user PATH (HKCU\\Environment\\Path) so the "
+          "manager's commands are found. Open a new terminal to use them.")
         .format(entry=WINDOWS_BIN_ENTRY))
+    log(_("Your previous PATH was saved to {backup}. To undo, run: "
+          "rundll32 sysdm.cpl,EditEnvironmentVariables  then select Path under your "
+          "user variables and remove that entry.").format(backup=shown))
+    append_log(paths, "path", WINDOWS_BIN_ENTRY, f"ok: prepended to user PATH, backup {shown}", now)
     return True
 
 

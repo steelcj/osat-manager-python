@@ -1893,9 +1893,10 @@ class FakeRegistry:
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE = "HKCU", 1, 2
     REG_SZ, REG_EXPAND_SZ, REG_DWORD = mp.REG_SZ, mp.REG_EXPAND_SZ, 4
 
-    def __init__(self, value=None):
+    def __init__(self, value=None, fail_write=None):
         self.value = value                      # (data, type) or None
         self.writes = []
+        self.fail_write = fail_write            # an exception SetValueEx raises
 
     class _Key:
         def __enter__(self):
@@ -1914,6 +1915,8 @@ class FakeRegistry:
         return self.value
 
     def SetValueEx(self, key, name, reserved, value_type, data):
+        if self.fail_write:
+            raise self.fail_write
         self.writes.append((name, value_type, data))
         self.value = (data, value_type)
 
@@ -1953,10 +1956,12 @@ class TestWindowsPath(Scratch):
                          r"C:\Users\ann\AppData\Local\x;%NOPE%\y")
 
     def outside_sandbox(self):
+        """Windows paths in scratch, with sandbox mode off so the (fake)
+        registry is used; the backup and log land in the scratch state dir."""
         patcher = mock.patch.dict(os.environ, {"PYTHON_MANAGER_SANDBOX": ""})
         patcher.start()
         self.addCleanup(patcher.stop)
-        return mp.Paths(windows=True, environ=self.ENV, home=self.home)
+        return self.windows_paths()
 
     def test_registry_write_keeps_the_value_type(self):
         paths = self.outside_sandbox()
@@ -1981,11 +1986,139 @@ class TestWindowsPath(Scratch):
                                                      lambda: broadcasts.append(1)))
         self.assertEqual((registry.writes, broadcasts), ([], []))
 
-    def test_unexpected_type_is_refused(self):
+    def test_unexpected_type_is_refused_and_logged(self):
+        paths = self.outside_sandbox()
         registry = FakeRegistry((1, FakeRegistry.REG_DWORD))
-        with self.assertRaisesRegex(mp.ManagerError, "unexpected type"):
-            mp.add_to_windows_user_path(self.outside_sandbox(), registry, lambda: None)
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertFalse(mp.add_to_windows_user_path(paths, registry, lambda: None))
         self.assertEqual(registry.writes, [])
+        self.assertIn("unexpected registry type", err.getvalue())
+        self.assertRegex(paths.log_file.read_text(), r" path %LOCALAPPDATA%\\Programs failed: ")
+        self.assertEqual(list(paths.state_dir.glob("path-backup-*")), [])
+
+
+class TestWindowsPathChangeIsVisible(Scratch):
+    """A PATH change is backed up, announced with how to undo it, and logged."""
+
+    outside_sandbox = TestWindowsPath.outside_sandbox
+
+    NOW = datetime(2026, 9, 29, 14, 2, 11, tzinfo=timezone.utc)
+    PREVIOUS = r"%USERPROFILE%\bin;C:\tools"
+
+    def change(self, registry, paths=None):
+        paths = paths or self.outside_sandbox()
+        broadcasts = []
+        with redirect_stderr(io.StringIO()) as err:
+            changed = mp.add_to_windows_user_path(paths, registry, lambda: broadcasts.append(1),
+                                                  now=self.NOW)
+        return paths, changed, err.getvalue(), broadcasts
+
+    def backup_of(self, paths):
+        return paths.state_dir / "path-backup-20260929T140211Z.txt"
+
+    def test_announcement(self):
+        paths, changed, err, _b = self.change(FakeRegistry((self.PREVIOUS, mp.REG_EXPAND_SZ)))
+        self.assertTrue(changed)
+        backup = paths.display(self.backup_of(paths))
+        self.assertEqual(err.splitlines(), [
+            "[manage-python] Added %LOCALAPPDATA%\\Programs to the start of your user PATH "
+            "(HKCU\\Environment\\Path) so the manager's commands are found. "
+            "Open a new terminal to use them.",
+            f"[manage-python] Your previous PATH was saved to {backup}. To undo, run: "
+            "rundll32 sysdm.cpl,EditEnvironmentVariables  then select Path under your "
+            "user variables and remove that entry."])
+        self.assertTrue(backup.startswith("%LOCALAPPDATA%"))
+
+    def test_backup_keeps_the_previous_value_and_type(self):
+        for value_type, name in ((mp.REG_EXPAND_SZ, "REG_EXPAND_SZ"), (mp.REG_SZ, "REG_SZ")):
+            with self.subTest(type=name):
+                paths, _c, _e, _b = self.change(FakeRegistry((self.PREVIOUS, value_type)))
+                raw = self.backup_of(paths).read_bytes()
+                self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
+                self.assertEqual(raw.decode().splitlines(), [
+                    "# HKCU\\Environment\\Path before manage-python prepended %LOCALAPPDATA%\\Programs",
+                    "saved: 2026-09-29T14:02:11Z",
+                    f"type: {name}",
+                    f"value: {self.PREVIOUS}"])
+                shutil.rmtree(paths.state_dir)
+
+    def test_backup_is_written_before_the_registry(self):
+        paths = self.outside_sandbox()
+        registry = FakeRegistry((self.PREVIOUS, mp.REG_EXPAND_SZ))
+        original = registry.SetValueEx
+
+        def set_value(*args):
+            self.assertTrue(self.backup_of(paths).is_file(), "registry written before the backup")
+            original(*args)
+        registry.SetValueEx = set_value
+        self.assertTrue(self.change(registry, paths)[1])
+
+    def test_backup_of_a_missing_value(self):
+        paths, changed, _e, _b = self.change(FakeRegistry(None))
+        self.assertTrue(changed)
+        self.assertEqual(self.backup_of(paths).read_text().splitlines()[2:], ["type: absent", "value: "])
+
+    def test_log_line(self):
+        paths, _c, _e, _b = self.change(FakeRegistry((self.PREVIOUS, mp.REG_EXPAND_SZ)))
+        backup = paths.display(self.backup_of(paths))
+        self.assertEqual(paths.log_file.read_text(),
+                         "2026-09-29T14:02:11Z path %LOCALAPPDATA%\\Programs ok: prepended to "
+                         f"user PATH, backup {backup}\n")
+
+    def test_already_present_prints_logs_and_backs_up_nothing(self):
+        paths, changed, err, broadcasts = self.change(
+            FakeRegistry((r"%LOCALAPPDATA%\Programs;C:\tools", mp.REG_EXPAND_SZ)))
+        self.assertFalse(changed)
+        self.assertEqual((err, broadcasts), ("", []))
+        self.assertFalse(paths.state_dir.exists())
+
+    def test_failed_write_is_logged_and_does_not_raise(self):
+        registry = FakeRegistry((self.PREVIOUS, mp.REG_EXPAND_SZ),
+                                fail_write=PermissionError("access denied"))
+        paths, changed, err, broadcasts = self.change(registry)
+        self.assertFalse(changed)
+        self.assertEqual((registry.writes, broadcasts), ([], []))
+        self.assertEqual(registry.value, (self.PREVIOUS, mp.REG_EXPAND_SZ))
+        self.assertIn("warning: your user PATH was not changed: access denied", err)
+        self.assertNotIn("Added", err)
+        self.assertEqual(paths.log_file.read_text(),
+                         "2026-09-29T14:02:11Z path %LOCALAPPDATA%\\Programs failed: access denied\n")
+
+    def test_failed_broadcast_still_counts_as_a_change(self):
+        paths = self.outside_sandbox()
+
+        def broken():
+            raise OSError("no window station")
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertTrue(mp.add_to_windows_user_path(
+                paths, FakeRegistry((self.PREVIOUS, mp.REG_SZ)), broken, now=self.NOW))
+        self.assertIn("could not tell Windows", err.getvalue())
+        self.assertIn(" ok: prepended to user PATH", paths.log_file.read_text())
+
+    def test_messages_go_through_gettext(self):
+        locale_dir = self.tmp / "locale"
+        write_mo(locale_dir / "fr" / "LC_MESSAGES" / "manage-python.mo", {
+            "Added {entry} to the start of your user PATH (HKCU\\Environment\\Path) so the "
+            "manager's commands are found. Open a new terminal to use them.":
+                "{entry} a été ajouté au début de votre PATH.",
+            "Your previous PATH was saved to {backup}. To undo, run: "
+            "rundll32 sysdm.cpl,EditEnvironmentVariables  then select Path under your "
+            "user variables and remove that entry.":
+                "Ancien PATH enregistré dans {backup}."})
+        mp.set_language("fr", locale_dir)
+        self.addCleanup(mp.set_language, "en")
+        paths, _c, err, _b = self.change(FakeRegistry((self.PREVIOUS, mp.REG_EXPAND_SZ)))
+        self.assertEqual(err.splitlines(), [
+            "[manage-python] %LOCALAPPDATA%\\Programs a été ajouté au début de votre PATH.",
+            f"[manage-python] Ancien PATH enregistré dans {paths.display(self.backup_of(paths))}."])
+        self.assertIn(" ok: prepended to user PATH", paths.log_file.read_text())
+
+    def test_sandbox_mode_writes_nothing(self):
+        paths = self.windows_paths()
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(mp.add_to_windows_user_path(
+                paths, FakeRegistry((self.PREVIOUS, mp.REG_SZ)), lambda: None, now=self.NOW))
+        self.assertFalse(paths.state_dir.exists())
 
 
 # ── --status: the manager line ────────────────────────────────────────────────
