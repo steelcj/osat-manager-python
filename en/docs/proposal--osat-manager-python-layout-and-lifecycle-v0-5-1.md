@@ -1,19 +1,73 @@
 ---
-title: "Proposal: osat-manager-python layout, lifecycle and aliases"
-description: "Proposed layout, commands, aliases and status output for osat-manager-python, the successor to osat-fluent-python-tool, with advantages, disadvantages and notes."
-date: 2026-09-29
-version: "0.5.0"
-status: "Draft"
+dc:title: "Proposal: osat-manager-python Layout, Lifecycle and Aliases"
+dcterms:version: "0.5.1"
+dc:creator: "Christopher Steel"
+dc:contributor: "Claude Opus 5.5 (Anthropic)"
+dc:description: "Proposed layout, commands, aliases, status output, translations and testing for osat-manager-python, the successor to osat-fluent-python-tool, with advantages, disadvantages and notes."
+dcterms:created: "2026-09-28"
+dcterms:modified: "2026-09-29"
+dc:format: "text/markdown"
+dc:language: "en"
+sat:language_bcp47: "en"
+dc:identifier: "proposal--osat-manager-python-layout-and-lifecycle"
+dcterms:rightsHolder: "Christopher Steel"
+dc:rights: >
+  Copyright 2026 Christopher Steel.
+  SPDX-License-Identifier: GPL-3.0-or-later
+sat:uuid: ""
+sat:repository: "osat-manager-python"
+sat:path: "en/docs/"
+sat:version_at_creation: "0.4.0"
+sat:migration_status: pre-sat
+sat:changelog:
+  - version: "0.5.1"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: >
+      Conformance pass against the repository's markdown defaults and the
+      versioned-documents style guide: Dublin Core frontmatter, Style Guide
+      line naming the technical guide, Abstract, Sources and
+      Acknowledgements, Resources, Citation Anchor Pairs in the house
+      format, canonical closing sequence, and the code documentation
+      license template. Content unchanged.
+  - version: "0.5.0"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: >
+      Decisions for the reference implementation: repository rename,
+      identifier and command separated, the manager installs itself,
+      Python 3.8 floor for first installs, gettext translations, testing.
+  - version: "0.4.0"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: "Supported platforms, NixOS, musl and versions side by side notes."
+  - version: "0.3.0"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: "Platforms section, alias record, testing on every platform."
+  - version: "0.2.0"
+    date: "2026-09-28"
+    author: "Christopher Steel"
+    notes: "Design principle, single switch rule, aliases, edge cases as notes."
+  - version: "0.1.0"
+    date: "2026-09-28"
+    author: "Christopher Steel"
+    notes: "Initial proposal from Windows testing of osat-fluent-python-tool 0.2.0."
 ---
 
-# Proposal: osat-manager-python layout, lifecycle and aliases
+# Proposal: osat-manager-python Layout, Lifecycle and Aliases
 
-Version: 0.5.0
+Version: 0.5.1
 Status: Draft
+Style Guide: style-guide--technical-documentation-for-technologists
 
-## Summary
+## Abstract
 
 This proposal turns osat-fluent-python-tool, an installer for self-contained CPython runtimes, into osat-manager-python, a full manager in the OSAT Fluent collection. It adopts the collection's lifecycle of install, switch, status and remove, keeps several Python versions installed side by side, and introduces aliases: the commands, such as `python` and `python3.12`, through which users reach them. Every alias can be renamed, and the same lifecycle and alias rules apply to every OSAT manager. The manager itself, `manage-python`, installs alongside the runtimes it manages, so it is available from any directory once installed.
+
+## Sources and Acknowledgements
+
+This proposal derives from the OSAT user-space installation specification <a name="apa-osat-spec-citation"></a>([Steel, 2026a](#apa-osat-spec-reference)) and from the manager lifecycle established in osat-fluent-restic-tool <a name="apa-restic-tool-citation"></a>([Steel, 2026b](#apa-restic-tool-reference)). Runtimes come from the python-build-standalone project <a name="apa-pbs-repo-citation"></a>([Astral, n.d.-b](#apa-pbs-repo-reference)), whose documentation defines the platform triples used here <a name="apa-pbs-docs-citation"></a>([Szorc, n.d.](#apa-pbs-docs-reference)). Protection of installed runtimes follows the Python packaging specification for externally managed environments <a name="apa-pypa-em-citation"></a>([Python Packaging Authority, n.d.](#apa-pypa-em-reference)). The design was developed from testing osat-fluent-python-tool 0.2.0 on Windows 11 and Linux Mint 22.3, with AI assistance from Claude Opus 5.5 (Anthropic).
 
 ## Design principle
 
@@ -21,9 +75,9 @@ The architecture is built for the scenarios people use every day: install a vers
 
 ## Context
 
-Testing osat-fluent-python-tool 0.2.0 on Windows 11 confirmed that the verified install works and showed what a manager needs to add: a way to keep and switch between versions, a command that follows the version in use, protection for the installed runtimes, and a way to resolve name collisions with other tools such as uv <a id="cite-astral-uv-1"></a>([Astral, n.d.-a](#ref-astral-uv)).
+Testing osat-fluent-python-tool 0.2.0 on Windows 11 confirmed that the verified install works and showed what a manager needs to add: a way to keep and switch between versions, a command that follows the version in use, protection for the installed runtimes, and a way to resolve name collisions with other tools such as uv <a name="apa-uv-python-versions-citation"></a>([Astral, n.d.-a](#apa-uv-python-versions-reference)).
 
-The collection has settled a manager lifecycle in osat-fluent-restic-tool and osat-fluent-sat-tool: versions side by side, a wrapper that reads a version pointer, a permanent verified archive, and `--install`, `--switch`, `--status` and `--remove` <a id="cite-steel-restic-1"></a>([Steel, 2026b](#ref-steel-restic)). This proposal applies that lifecycle to Python.
+The collection has settled a manager lifecycle in osat-fluent-restic-tool and osat-fluent-sat-tool: versions side by side, a wrapper that reads a version pointer, a permanent verified archive, and `--install`, `--switch`, `--status` and `--remove` <a name="apa-restic-tool-citation-2"></a>([Steel, 2026b](#apa-restic-tool-reference)). This proposal applies that lifecycle to Python.
 
 ## Proposed changes
 
@@ -88,7 +142,7 @@ Windows:
     env.cmd          env.ps1                operator environment
 ```
 
-Install directories are named by micro version, for example `3.12.14`. The python-build-standalone build tag, for example `20260924`, is recorded in `PROVENANCE` and used in the archive path <a id="cite-astral-pbs-1"></a>([Astral, n.d.-b](#ref-astral-pbs)).
+Install directories are named by micro version, for example `3.12.14`. The python-build-standalone build tag, for example `20260924`, is recorded in `PROVENANCE` and used in the archive path <a name="apa-pbs-repo-citation-2"></a>([Astral, n.d.-b](#apa-pbs-repo-reference)).
 
 #### Versions side by side
 
@@ -203,11 +257,11 @@ osat-manager-python supports the platforms python-build-standalone publishes run
 
 There are no FreeBSD, OpenBSD or other BSD builds, so the manager cannot install Python on those systems.
 
-macOS is not an exception to this. Its Darwin foundation has BSD heritage, and the BSD part of its kernel derives mainly from FreeBSD <a id="cite-apple-bsd-1"></a>([Apple, n.d.](#ref-apple-bsd)), but that code runs inside XNU alongside Mach, and macOS uses its own executable format and system libraries. Programs built for FreeBSD do not run on macOS, and programs built for macOS do not run on FreeBSD, which is why python-build-standalone publishes macOS builds separately and why they do not help on the BSDs.
+macOS is not an exception to this. Its Darwin foundation has BSD heritage, and the BSD part of its kernel derives mainly from FreeBSD <a name="apa-apple-bsd-citation"></a>([Apple, n.d.](#apa-apple-bsd-reference)), but that code runs inside XNU alongside Mach, and macOS uses its own executable format and system libraries. Programs built for FreeBSD do not run on macOS, and programs built for macOS do not run on FreeBSD, which is why python-build-standalone publishes macOS builds separately and why they do not help on the BSDs.
 
 #### Runtime selection
 
-python-build-standalone names each build by an LLVM target triple <a id="cite-szorc-pbs-1"></a>([Szorc, n.d.](#ref-szorc-pbs)). The manager selects the triple from the operating system and CPU architecture, and on Linux from the C library. The common cases are:
+python-build-standalone names each build by an LLVM target triple <a name="apa-pbs-docs-citation-2"></a>([Szorc, n.d.](#apa-pbs-docs-reference)). The manager selects the triple from the operating system and CPU architecture, and on Linux from the C library. The common cases are:
 
 | Platform | Triple |
 | --- | --- |
@@ -254,7 +308,7 @@ Linux distributions add `~/.local/bin` to PATH automatically. macOS does not, so
 
 ### Protecting the installed runtimes
 
-After extracting a runtime, the manager writes an `EXTERNALLY-MANAGED` file into that runtime's standard library directory. pip then refuses to install into the runtime itself and shows the manager's message, which points users to `python3.12 -m venv` <a id="cite-pypa-em-1"></a>([Python Packaging Authority, n.d.](#ref-pypa-em)). Venvs are unaffected. Anaconda's protected base installer takes the same approach for the same reason: installing into the base environment is the most common way users break their installation <a id="cite-anaconda-pbe-1"></a>([Anaconda, n.d.](#ref-anaconda-pbe)).
+After extracting a runtime, the manager writes an `EXTERNALLY-MANAGED` file into that runtime's standard library directory. pip then refuses to install into the runtime itself and shows the manager's message, which points users to `python3.12 -m venv` <a name="apa-pypa-em-citation-2"></a>([Python Packaging Authority, n.d.](#apa-pypa-em-reference)). Venvs are unaffected. Anaconda's protected base installer takes the same approach for the same reason: installing into the base environment is the most common way users break their installation <a name="apa-anaconda-pbe-citation"></a>([Anaconda, n.d.](#apa-anaconda-pbe-reference)).
 
 ### Archive and provenance
 
@@ -325,7 +379,7 @@ These notes cover situations some users will meet. They are documentation, not d
 
 ### Coexisting with uv
 
-uv writes versioned aliases such as `python3.12` into `~/.local/bin` and does not overwrite files it did not write <a id="cite-astral-uv-2"></a>([Astral, n.d.-a](#ref-astral-uv)). If both tools want the same name, rename one side: `--alias` on the OSAT side, or `uv python install --no-bin` on the uv side.
+uv writes versioned aliases such as `python3.12` into `~/.local/bin` and does not overwrite files it did not write <a name="apa-uv-python-versions-citation-2"></a>([Astral, n.d.-a](#apa-uv-python-versions-reference)). If both tools want the same name, rename one side: `--alias` on the OSAT side, or `uv python install --no-bin` on the uv side.
 
 ### The Microsoft Store alias
 
@@ -353,11 +407,11 @@ A Python running under Rosetta reports an Intel architecture, which would select
 
 ### musl-based Linux
 
-Distributions such as Alpine use musl rather than glibc. The manager detects this and selects the musl build. python-build-standalone's musl builds are statically linked, and as a side effect they cannot load compiled extension modules <a id="cite-szorc-pbs-2"></a>([Szorc, n.d.](#ref-szorc-pbs)). Pure-Python packages work, but packages that ship compiled code may not.
+Distributions such as Alpine use musl rather than glibc. The manager detects this and selects the musl build. python-build-standalone's musl builds are statically linked, and as a side effect they cannot load compiled extension modules <a name="apa-pbs-docs-citation-3"></a>([Szorc, n.d.](#apa-pbs-docs-reference)). Pure-Python packages work, but packages that ship compiled code may not.
 
 ### NixOS
 
-NixOS does not keep a dynamic loader at the standard path, such as `/lib64/ld-linux-x86-64.so.2`, because its loader lives in the Nix store. The glibc builds expect the standard path, so on a default NixOS system running a runtime fails with a "No such file or directory" error, even though the file exists. Enabling nix-ld in the system configuration places a shim loader at the standard path and lets such binaries run unmodified <a id="cite-nixld-1"></a>([nix-community, n.d.](#ref-nixld)):
+NixOS does not keep a dynamic loader at the standard path, such as `/lib64/ld-linux-x86-64.so.2`, because its loader lives in the Nix store. The glibc builds expect the standard path, so on a default NixOS system running a runtime fails with a "No such file or directory" error, even though the file exists. Enabling nix-ld in the system configuration places a shim loader at the standard path and lets such binaries run unmodified <a name="apa-nix-ld-citation"></a>([nix-community, n.d.](#apa-nix-ld-reference)):
 
 ```nix
 programs.nix-ld.enable = true;
@@ -367,7 +421,7 @@ The musl builds do not need the loader, but their limit on compiled extension mo
 
 ## Collection-wide implications
 
-Adopting this proposal implies the following changes to the OSAT user-space installation specification and the other managers <a id="cite-steel-spec-1"></a>([Steel, 2026a](#ref-steel-spec)):
+Adopting this proposal implies the following changes to the OSAT user-space installation specification and the other managers <a name="apa-osat-spec-citation-2"></a>([Steel, 2026a](#apa-osat-spec-reference)):
 
 - Record `-manager` as the target management identifier, and `manage-<name>` as the command pattern.
 - Define that each manager installs itself under `<identifier>/manage-<name>/<version>/` and is reached through its own alias.
@@ -377,34 +431,64 @@ Adopting this proposal implies the following changes to the OSAT user-space inst
 - Use "default", "installed" and "archived" in status output, replacing "active".
 - Place the version pointer in `%LOCALAPPDATA%\<identifier>\` on Windows.
 
-## References
-
-<a id="ref-anaconda-pbe"></a>Anaconda. (n.d.). *Protected base installers*. Anaconda documentation. https://www.anaconda.com/docs/getting-started/protected-base-beta [↩](#cite-anaconda-pbe-1)
-
-<a id="ref-apple-bsd"></a>Apple. (n.d.). *BSD overview*. Kernel programming guide. Apple Developer Documentation Archive. https://developer.apple.com/library/content/documentation/Darwin/Conceptual/KernelProgramming/BSD/BSD.html [↩](#cite-apple-bsd-1)
-
-<a id="ref-astral-uv"></a>Astral. (n.d.-a). *Python versions*. uv documentation. https://docs.astral.sh/uv/concepts/python-versions/ [↩](#cite-astral-uv-1)
-
-<a id="ref-astral-pbs"></a>Astral. (n.d.-b). *python-build-standalone* [Computer software]. GitHub. https://github.com/astral-sh/python-build-standalone [↩](#cite-astral-pbs-1)
-
-<a id="ref-nixld"></a>nix-community. (n.d.). *nix-ld* [Computer software]. GitHub. https://github.com/nix-community/nix-ld [↩](#cite-nixld-1)
-
-<a id="ref-pypa-em"></a>Python Packaging Authority. (n.d.). *Externally managed environments*. Python Packaging User Guide. https://packaging.python.org/en/latest/specifications/externally-managed-environments/ [↩](#cite-pypa-em-1)
-
-<a id="ref-steel-spec"></a>Steel, C. (2026a). *OSAT user-space installation specification* (Version 0.2.0). GitHub. https://github.com/steelcj/osat-fluent [↩](#cite-steel-spec-1)
-
-<a id="ref-steel-restic"></a>Steel, C. (2026b). *osat-fluent-restic-tool* [Computer software]. GitHub. https://github.com/steelcj/osat-fluent-restic-tool [↩](#cite-steel-restic-1)
-
-<a id="ref-szorc-pbs"></a>Szorc, G. (n.d.). *Running distributions*. python-build-standalone documentation. https://gregoryszorc.com/docs/python-build-standalone/main/running.html [↩](#cite-szorc-pbs-1)
-
 ## License
 
-This document, *Proposal: osat-manager-python layout, lifecycle and aliases*, by **Christopher Steel**, with AI assistance from **Claude (Anthropic)**, is licensed under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html).
+This document, *Proposal: osat-manager-python Layout, Lifecycle and Aliases*, by **Christopher Steel**, with AI assistance from **Claude Opus 5.5 (Anthropic)**, is licensed under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html).
+
+## Resources
+
+### OSAT collection
+
+- [OSAT user-space installation specification](#apa-osat-spec-reference)
+- [osat-fluent-restic-tool](#apa-restic-tool-reference)
+
+### Python runtimes and packaging
+
+- [python-build-standalone](#apa-pbs-repo-reference)
+- [python-build-standalone: Running distributions](#apa-pbs-docs-reference)
+- [Externally managed environments](#apa-pypa-em-reference)
+- [uv: Python versions](#apa-uv-python-versions-reference)
+- [Anaconda: Protected base installers](#apa-anaconda-pbe-reference)
+
+### Platforms
+
+- [Apple: BSD overview](#apa-apple-bsd-reference)
+- [nix-ld](#apa-nix-ld-reference)
+
+## References
+
+<a name="apa-anaconda-pbe-reference"></a>Anaconda. (n.d.). *Protected base installers*. Anaconda documentation. https://www.anaconda.com/docs/getting-started/protected-base-beta
+[Return to citation](#apa-anaconda-pbe-citation)
+
+<a name="apa-apple-bsd-reference"></a>Apple. (n.d.). *BSD overview*. Kernel programming guide. Apple Developer Documentation Archive. https://developer.apple.com/library/content/documentation/Darwin/Conceptual/KernelProgramming/BSD/BSD.html
+[Return to citation](#apa-apple-bsd-citation)
+
+<a name="apa-uv-python-versions-reference"></a>Astral. (n.d.-a). *Python versions*. uv documentation. https://docs.astral.sh/uv/concepts/python-versions/
+[Return to citation](#apa-uv-python-versions-citation)
+
+<a name="apa-pbs-repo-reference"></a>Astral. (n.d.-b). *python-build-standalone* [Computer software]. GitHub. https://github.com/astral-sh/python-build-standalone
+[Return to citation](#apa-pbs-repo-citation)
+
+<a name="apa-nix-ld-reference"></a>nix-community. (n.d.). *nix-ld* [Computer software]. GitHub. https://github.com/nix-community/nix-ld
+[Return to citation](#apa-nix-ld-citation)
+
+<a name="apa-pypa-em-reference"></a>Python Packaging Authority. (n.d.). *Externally managed environments*. Python Packaging User Guide. https://packaging.python.org/en/latest/specifications/externally-managed-environments/
+[Return to citation](#apa-pypa-em-citation)
+
+<a name="apa-osat-spec-reference"></a>Steel, C. (2026a). *OSAT user-space installation specification* (Version 0.2.0). GitHub. https://github.com/steelcj/osat-fluent
+[Return to citation](#apa-osat-spec-citation)
+
+<a name="apa-restic-tool-reference"></a>Steel, C. (2026b). *osat-fluent-restic-tool* [Computer software]. GitHub. https://github.com/steelcj/osat-fluent-restic-tool
+[Return to citation](#apa-restic-tool-citation)
+
+<a name="apa-pbs-docs-reference"></a>Szorc, G. (n.d.). *Running distributions*. python-build-standalone documentation. https://gregoryszorc.com/docs/python-build-standalone/main/running.html
+[Return to citation](#apa-pbs-docs-citation)
 
 ## Changelog
 
 | Version | Status | Notes |
-| --- | --- | --- |
+|---------|--------|-------|
+| 0.5.1 | Draft | Conformance pass against the repository's markdown defaults and the versioned-documents style guide: Dublin Core frontmatter, Style Guide line naming the technical guide, Abstract, Sources and Acknowledgements, Resources, Citation Anchor Pairs in the house format, canonical closing sequence, code documentation license template; content unchanged |
 | 0.5.0 | Draft | Decisions for the reference implementation: repository renamed to osat-manager-python with 0.3.0 as its first release; management identifier and command separated, with `manage-python` and the `manage-<name>` pattern; the manager installs itself, is reached through its own alias and runs on the default runtime; Python 3.8 floor for first installs on Linux and macOS; gettext translations and their locations; `unittest` and end-to-end testing; change from 0.2.0's versioned-only wrappers explained |
 | 0.4.0 | Draft | Versions side by side note, including why the interpreter keeps its minor-version name. Supported platforms defined as those python-build-standalone publishes, checked against release 20260929, with the absence of BSD builds and the difference between macOS and the BSDs explained. Windows ARM64 and Linux ARM64 musl added to runtime selection. NixOS note and test matrix line. musl note expanded with the static-linking limit. References added for Apple, nix-ld and the python-build-standalone documentation |
 | 0.3.0 | Draft | Platforms section: runtime selection by platform triple, alias wrappers for POSIX and Windows, PATH per platform. Alias names recorded in the pointer so renames survive installs and switches. XDG overrides respected on Linux and macOS. Testing covers every platform, with untested platforms declared in release notes. Notes for fresh Linux accounts, the system python3, Rosetta and musl |
