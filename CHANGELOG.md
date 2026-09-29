@@ -9,11 +9,17 @@ N` file and the git tags. Dates are ISO 8601.
 
 ## [1.0.2] - 2026-09-29
 
+Verified end to end on Linux x86-64. Not yet verified: on Windows, the registry write, the `.cmd` and `.ps1` aliases and `install.ps1`; macOS; Python 3.8 at run time. The Linux end-to-end pass ran on the code tagged 1.0.1; 1.0.2 changes only the Windows PATH code, which is covered by unit tests.
+
+First published release of the 1.0.1 changes below, since 1.0.1 was never released. Supersedes 1.0.0, whose `install.sh` and `install.ps1` still ran the 0.2.0 installer, `install-python.py`.
+
 ### Changed
 
 - The Windows user PATH change is visible and reversible. When `--install` actually changes it, the previous `Path` value and its registry type are saved to `path-backup-<UTC>.txt` in the state directory first, the change is announced on standard error with how to undo it, and a `path` line is logged. When the entry is already present nothing is printed or logged. A failed write is logged as `failed` and reported, and no longer fails the install.
 
 ## [1.0.1] - 2026-09-29
+
+Tagged locally but never pushed or released; these changes were first published in 1.0.2.
 
 Verified end to end on Linux x86-64. Not yet verified: the Windows registry write, the `.cmd` and `.ps1` aliases, `install.ps1`, macOS, and Python 3.8 at run time. Supersedes 1.0.0, whose `install.sh` and `install.ps1` still ran the 0.2.0 installer, `install-python.py`.
 

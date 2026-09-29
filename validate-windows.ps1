@@ -1,0 +1,505 @@
+#Requires -Version 5.1
+# validate-windows.ps1
+#
+# source
+#   project: osat-manager-python
+#   path: validate-windows.ps1
+#
+# Hardware validation of manage-python on Windows 11, run from a fresh VM
+# snapshot under Windows PowerShell 5.1. The counterpart of
+# validate-windows.py in osat-fluent-restic-tool, which simulates Windows on
+# another platform: this script runs the real thing, so it covers what a
+# simulation cannot: install.ps1, the registry write, the .cmd and .ps1
+# aliases under cmd.exe and powershell.exe, command precedence, and the
+# lifecycle against real python-build-standalone downloads.
+#
+# It changes the account it runs under: it installs runtimes, writes aliases
+# and prepends %LOCALAPPDATA%\Programs to the user PATH. Run it only on a
+# disposable VM snapshot, and revert the snapshot afterwards.
+#
+# Every check prints PASS or FAIL; facts worth reporting print NOTE. The
+# report file, validate-windows-report-<computer>-<UTC>.txt, collects all of
+# it together with the captured output and a checklist of manual steps.
+#
+# Usage, from the extracted release folder with this script copied into it:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File .\validate-windows.ps1 -FreshSnapshot
+#
+# See en/docs/guides/development/windows-validation-for-manage-python-v0-1-0.md.
+
+param(
+    [switch]$FreshSnapshot,
+    [string]$ReportDir = $PSScriptRoot,
+    [string]$Line = "3.12",
+    [string]$Other = "3.13"
+)
+
+$ErrorActionPreference = "Continue"
+$Root = $PSScriptRoot
+$Started = [DateTime]::UtcNow
+$Stamp = $Started.ToString("yyyyMMdd'T'HHmmss'Z'")
+$Work = Join-Path $env:TEMP "manage-python-validate-$Stamp"
+$Programs = Join-Path $env:LOCALAPPDATA "Programs"
+$Share = Join-Path $env:LOCALAPPDATA "python-manager"
+$Logs = Join-Path $Share "logs"
+$OperatorDir = Join-Path $env:APPDATA "python-manager"
+$ReportPath = Join-Path $ReportDir "validate-windows-report-$($env:COMPUTERNAME)-$Stamp.txt"
+$Report = New-Object System.Collections.Generic.List[string]
+$Failures = New-Object System.Collections.Generic.List[string]
+$Captured = New-Object System.Collections.Generic.List[string]
+$script:ChildPath = $env:Path
+
+# -- Reporting -----------------------------------------------------------------
+
+function Say([string]$Text) {
+    Write-Host $Text
+    $Report.Add($Text)
+}
+
+function Section([string]$Title) {
+    Say ""
+    Say "[$Title]"
+}
+
+function Indent([string]$Text) {
+    return "        " + (($Text.TrimEnd() -replace "`r", "") -replace "`n", "`n        ")
+}
+
+function Check([string]$Name, [bool]$Condition, [string]$Detail = "") {
+    if ($Condition) {
+        Say "  PASS  $Name"
+    } else {
+        Say "  FAIL  $Name"
+        if ($Detail) { Say (Indent $Detail) }
+        $Failures.Add($Name)
+    }
+}
+
+function Note([string]$Name, [string]$Value) {
+    Say "  NOTE  ${Name}:"
+    Say (Indent $Value)
+}
+
+function Capture([string]$Title, [string]$Text) {
+    $Captured.Add("=== $Title")
+    $Captured.Add(($Text -replace "`r", "").TrimEnd())
+    $Captured.Add("")
+}
+
+# -- Running things ------------------------------------------------------------
+
+function Write-Text([string]$Path, [string]$Text, [switch]$Crlf) {
+    if ($Crlf) { $Text = ($Text -replace "`r", "") -replace "`n", "`r`n" }
+    [IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
+}
+
+# Start a process with its own output captured, bypassing PowerShell's
+# handling of native standard error. Path is the "new terminal" PATH once
+# the manager has changed it.
+function Invoke-Native([string]$File, [string]$Arguments, [hashtable]$Env = @{}, [int]$Seconds = 900) {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $File
+    $info.Arguments = $Arguments
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.WorkingDirectory = $Work
+    $info.EnvironmentVariables["Path"] = $script:ChildPath
+    foreach ($key in $Env.Keys) {
+        if ($null -eq $Env[$key]) { $info.EnvironmentVariables.Remove($key) }
+        else { $info.EnvironmentVariables[$key] = [string]$Env[$key] }
+    }
+    $process = [System.Diagnostics.Process]::Start($info)
+    $out = $process.StandardOutput.ReadToEndAsync()
+    $err = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($Seconds * 1000)) {
+        $process.Kill()
+        return [pscustomobject]@{ Code = -1; Out = $out.Result; Err = "timed out after $Seconds s`n" + $err.Result }
+    }
+    $process.WaitForExit()
+    return [pscustomobject]@{ Code = $process.ExitCode; Out = $out.Result; Err = $err.Result }
+}
+
+$script:BatchCount = 0
+
+# Run a batch file under cmd.exe; the body follows "@echo off".
+function Invoke-Cmd([string]$Body, [hashtable]$Env = @{}, [int]$Seconds = 900) {
+    $script:BatchCount++
+    $bat = Join-Path $Work ("step{0:D2}.bat" -f $script:BatchCount)
+    Write-Text $bat ("@echo off`n" + $Body + "`n") -Crlf
+    return Invoke-Native "cmd.exe" "/d /s /c `"`"$bat`"`"" $Env $Seconds
+}
+
+$script:PsCount = 0
+
+# Run a script under Windows PowerShell 5.1 with a bypassed execution policy.
+function Invoke-Ps([string]$Body, [hashtable]$Env = @{}, [int]$Seconds = 900) {
+    $script:PsCount++
+    $ps1 = Join-Path $Work ("step{0:D2}.ps1" -f $script:PsCount)
+    Write-Text $ps1 $Body -Crlf
+    return Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ps1`"" $Env $Seconds
+}
+
+function Show($Result) {
+    return "exit $($Result.Code)`nstdout:`n$($Result.Out)`nstderr:`n$($Result.Err)"
+}
+
+# -- Facts about the machine ---------------------------------------------------
+
+function Get-UserPath {
+    $key = Get-Item "HKCU:\Environment"
+    if ($key.GetValueNames() -notcontains "Path") { return [pscustomobject]@{ Kind = "absent"; Raw = $null } }
+    $kind = $key.GetValueKind("Path").ToString()
+    $name = switch ($kind) { "ExpandString" { "REG_EXPAND_SZ" } "String" { "REG_SZ" } default { $kind } }
+    return [pscustomobject]@{ Kind = $name; Raw = $key.GetValue("Path", $null, "DoNotExpandEnvironmentNames") }
+}
+
+# PATH as a terminal opened after the change sees it: machine, then user.
+function Get-NewTerminalPath {
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $user = [Environment]::GetEnvironmentVariable("Path", "User")
+    return ($machine.TrimEnd(";") + ";" + $user)
+}
+
+function Get-Pointer {
+    $values = @{}
+    $file = Join-Path $Share "python-manager.env.cmd"
+    if (Test-Path $file) {
+        foreach ($text in (Get-Content $file)) {
+            if ($text -match '^set "(PYTHON_MANAGER_[A-Z0-9_]+)=([^"]*)"$') { $values[$Matches[1]] = $Matches[2] }
+        }
+    }
+    return $values
+}
+
+# The version an alias runs, through its .cmd under cmd.exe.
+function Get-CmdVersion([string]$Alias) {
+    $result = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\$Alias.cmd`" --version"
+    if ($result.Out -match "Python (\d+\.\d+\.\d+)") { return $Matches[1] }
+    return "none: " + (Show $result)
+}
+
+# The version an alias runs, through its .ps1 under powershell.exe 5.1.
+function Get-Ps1Version([string]$Alias) {
+    $result = Invoke-Ps "& (Join-Path `$env:LOCALAPPDATA 'Programs\$Alias.ps1') --version"
+    if ($result.Out -match "Python (\d+\.\d+\.\d+)") { return $Matches[1] }
+    return "none: " + (Show $result)
+}
+
+function Manage([string]$Arguments, [hashtable]$Env = @{}) {
+    return Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\manage-python.cmd`" $Arguments" $Env 1800
+}
+
+function Log-Lines {
+    $file = Join-Path $Logs "manage-python.log"
+    if (Test-Path $file) { return @(Get-Content $file) }
+    return @()
+}
+
+# -- Preconditions -------------------------------------------------------------
+
+$problems = @()
+if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {
+    $problems += "run this under Windows PowerShell 5.1 (powershell.exe), not PowerShell $($PSVersionTable.PSVersion)"
+}
+if (-not $FreshSnapshot) {
+    $problems += "this script changes the account it runs under; run it on a fresh VM snapshot and pass -FreshSnapshot"
+}
+if (Test-Path $Share) {
+    $problems += "$Share already exists; start from a fresh snapshot"
+}
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $problems += "run as an ordinary user, not from an elevated (Administrator) window"
+}
+foreach ($required in @("install.ps1", "manage-python.py", "VERSION")) {
+    if (-not (Test-Path (Join-Path $Root $required))) { $problems += "$required is not next to this script in $Root" }
+}
+if ($problems.Count -gt 0) {
+    foreach ($problem in $problems) { Write-Host "[validate-windows] refusing: $problem" }
+    exit 2
+}
+New-Item -ItemType Directory -Path $Work | Out-Null
+
+try {
+    $Version = (Get-Content (Join-Path $Root "VERSION") -TotalCount 1).Trim()
+    $os = Get-CimInstance Win32_OperatingSystem
+    Say "manage-python Windows validation"
+    Say "  manager under test: $Version, from $Root"
+    Say "  started:            $($Started.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+    Say "  machine:            $($os.Caption) $($os.Version) build $($os.BuildNumber), $env:PROCESSOR_ARCHITECTURE"
+    Say "  PowerShell:         $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+    Say "  culture:            $((Get-Culture).Name), UI $((Get-UICulture).Name)"
+    Say "  work directory:     $Work"
+
+    # -- [1] Before ----------------------------------------------------------------
+    Section "1 Before installing"
+    $before = Get-UserPath
+    Note "user Path type" $before.Kind
+    Note "user Path value" ([string]$before.Raw)
+    Note "execution policies" ((Get-ExecutionPolicy -List | Out-String).Trim())
+    $storeAlias = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\python.exe"
+    Note "Microsoft Store python alias present" ([string](Test-Path $storeAlias))
+    $pre = Invoke-Ps "Get-Command python -All -ErrorAction SilentlyContinue | ForEach-Object { `$_.Source }"
+    Note "Get-Command python -All" ($(if ($pre.Out.Trim()) { $pre.Out.Trim() } else { "(none)" }))
+
+    # -- [2] Bootstrap -------------------------------------------------------------
+    Section "2 Bootstrap through install.ps1 under Windows PowerShell 5.1"
+    $boot = Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$(Join-Path $Root 'install.ps1')`" --install $Line" @{} 1800
+    Capture "install.ps1 --install $Line" (Show $boot)
+    Check "install.ps1 exits 0" ($boot.Code -eq 0) (Show $boot)
+    $pointer = Get-Pointer
+    $newest = [string]$pointer["PYTHON_MANAGER_DEFAULT"]
+    Check "a $Line runtime is the default" ($newest.StartsWith("$Line.")) ("pointer: " + ($pointer | Out-String))
+    Check "the manager installed itself" (Test-Path (Join-Path $Share "manage-python\$Version\manage-python.py"))
+    Check "SELF is $Version" ($pointer["PYTHON_MANAGER_SELF"] -eq $Version)
+    foreach ($name in @("python", "python$Line", "manage-python")) {
+        foreach ($extension in @("cmd", "ps1")) {
+            Check "alias $name.$extension written" (Test-Path (Join-Path $Programs "$name.$extension"))
+        }
+    }
+    Check "no bootstrap Python left in TEMP" (@(Get-ChildItem $env:TEMP -Filter "osat-manager-python-bootstrap-*" -ErrorAction SilentlyContinue).Count -eq 0)
+
+    # -- [3] The user PATH write ---------------------------------------------------
+    Section "3 The user PATH write"
+    $after = Get-UserPath
+    Note "user Path after" ("$($after.Kind): $($after.Raw)")
+    $expectedKind = if ($before.Kind -eq "absent") { "REG_EXPAND_SZ" } else { $before.Kind }
+    Check "registry type kept ($expectedKind)" ($after.Kind -eq $expectedKind) "was $($before.Kind), now $($after.Kind)"
+    $entry = if ($expectedKind -eq "REG_SZ") { "$env:LOCALAPPDATA\Programs" } else { "%LOCALAPPDATA%\Programs" }
+    Check "Path starts with $entry" (([string]$after.Raw).StartsWith($entry)) ([string]$after.Raw)
+    $announce = "[manage-python] Added %LOCALAPPDATA%\Programs to the start of your user PATH (HKCU\Environment\Path) so the manager's commands are found. Open a new terminal to use them."
+    Check "the change is announced" ($boot.Err.Contains($announce)) $boot.Err
+    Check "the undo instructions are shown" ($boot.Err -match "\[manage-python\] Your previous PATH was saved to %LOCALAPPDATA%\\python-manager\\logs\\path-backup-\d{8}T\d{6}Z\.txt\. To undo, run: rundll32 sysdm\.cpl,EditEnvironmentVariables  then select Path under your user variables and remove that entry\.") $boot.Err
+    $backups = @(Get-ChildItem $Logs -Filter "path-backup-*.txt" -ErrorAction SilentlyContinue)
+    Check "one backup file" ($backups.Count -eq 1) (($backups | ForEach-Object { $_.Name }) -join ", ")
+    if ($backups.Count -ge 1) {
+        $backupLines = @(Get-Content $backups[0].FullName)
+        Capture "PATH backup $($backups[0].Name)" ($backupLines -join "`n")
+        Check "backup records the previous type" ($backupLines -contains "type: $($before.Kind)") ($backupLines -join "`n")
+        Check "backup records the previous value" ($backupLines -contains ("value: " + [string]$before.Raw)) ($backupLines -join "`n")
+        Check "backup has CRLF line endings" ([IO.File]::ReadAllText($backups[0].FullName).Contains("`r`n"))
+    }
+    $pathLines = @(Log-Lines | Where-Object { $_ -match "^\S+ path " })
+    Check "one path log line" ($pathLines.Count -eq 1) ((Log-Lines) -join "`n")
+    Check "path log line format" ($pathLines.Count -ge 1 -and $pathLines[0] -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ path %LOCALAPPDATA%\\Programs ok: prepended to user PATH, backup %LOCALAPPDATA%\\python-manager\\logs\\path-backup-\d{8}T\d{6}Z\.txt$') ($pathLines -join "`n")
+
+    $script:ChildPath = Get-NewTerminalPath
+    $order = Invoke-Ps "Get-Command python -All | ForEach-Object { `$_.Source }"
+    $sources = @($order.Out -split "`r?`n" | Where-Object { $_ })
+    Note "a new terminal: Get-Command python -All" ($sources -join "`n")
+    Check "a new terminal finds the manager's python first" ($sources.Count -ge 1 -and $sources[0] -like "$Programs\*") ($sources -join "`n")
+    $storeIndex = [array]::FindIndex([string[]]$sources, [Predicate[string]]{ param($s) $s -like "*\WindowsApps\python.exe" })
+    if ($storeIndex -ge 0) { Check "the Store alias comes after it" ($storeIndex -gt 0) ($sources -join "`n") }
+    else { Note "the Store alias" "not on PATH in a new terminal" }
+    $where = Invoke-Cmd "where python"
+    Note "a new terminal: where python" $where.Out.Trim()
+    Check "cmd.exe finds python.cmd first" (($where.Out -split "`r?`n")[0] -eq (Join-Path $Programs "python.cmd")) $where.Out
+
+    # -- [4] More installs through the installed manager ---------------------------
+    Section "4 More installs through the installed manager"
+    $third = Manage "--install $Other"
+    Capture "manage-python.cmd --install $Other" (Show $third)
+    Check "manage-python.cmd --install $Other exits 0" ($third.Code -eq 0) (Show $third)
+    $pointer = Get-Pointer
+    $otherVersion = [string]$pointer["PYTHON_MANAGER_" + $Other.Replace(".", "_")]
+    Check "python now runs $otherVersion" ((Get-CmdVersion "python") -eq $otherVersion)
+    Check "python$Line still runs $newest" ((Get-CmdVersion "python$Line") -eq $newest)
+    Check "an unchanged PATH is not announced" (-not $third.Err.Contains("Added %LOCALAPPDATA%")) $third.Err
+    Check "an unchanged PATH is not backed up again" (@(Get-ChildItem $Logs -Filter "path-backup-*.txt").Count -eq 1)
+    Check "an unchanged PATH is not logged again" (@(Log-Lines | Where-Object { $_ -match "^\S+ path " }).Count -eq 1)
+
+    $parts = $newest.Split(".")
+    $older = "{0}.{1}.{2}" -f $parts[0], $parts[1], ([int]$parts[2] - 1)
+    $fourth = Invoke-Ps "& (Join-Path `$env:LOCALAPPDATA 'Programs\manage-python.ps1') --install $older; exit `$LASTEXITCODE" @{} 1800
+    Capture "manage-python.ps1 --install $older" (Show $fourth)
+    Check "manage-python.ps1 --install $older exits 0" ($fourth.Code -eq 0) (Show $fourth)
+    Check "python and python$Line run $older" ((Get-CmdVersion "python") -eq $older -and (Get-Ps1Version "python$Line") -eq $older)
+
+    # -- [5] Aliases: arguments, exit codes, environment ---------------------------
+    Section "5 The .cmd and .ps1 aliases"
+    Write-Text (Join-Path $Work "args.py") "import json, os, sys`nprint(json.dumps({'argv': sys.argv[1:], 'keep': os.environ.get('OSAT_KEEP')}))`n"
+    Write-Text (Join-Path $Work "exitcode.py") "import sys`nsys.exit(int(sys.argv[1]))`n"
+    New-Item -ItemType Directory -Path $OperatorDir -Force | Out-Null
+    Write-Text (Join-Path $OperatorDir "env.cmd") "set `"OSAT_KEEP=changed-by-operator`"`n" -Crlf
+    Write-Text (Join-Path $OperatorDir "env.ps1") "`$env:OSAT_KEEP = 'changed-by-operator'`n`$env:OSAT_ADDED = 'added-by-operator'`n" -Crlf
+    $expectedArgs = '{"argv": ["a b", "c", "d=e", "f,g"], "keep": "changed-by-operator"}'
+
+    $cmdRun = Invoke-Cmd @"
+set "OSAT_KEEP=before"
+call "%LOCALAPPDATA%\Programs\python$Line.cmd" "%~dp0args.py" "a b" c d=e f,g
+echo EXIT0=%ERRORLEVEL%
+call "%LOCALAPPDATA%\Programs\python$Line.cmd" "%~dp0exitcode.py" 7
+echo EXIT7=%ERRORLEVEL%
+echo KEEP=%OSAT_KEEP%
+if defined PYTHON_MANAGER_DEFAULT (echo LEAK=yes) else (echo LEAK=no)
+"@
+    Capture "python$Line.cmd under cmd.exe" (Show $cmdRun)
+    $cmdOut = @($cmdRun.Out -split "`r?`n")
+    Check ".cmd passes arguments through" ($cmdOut -contains $expectedArgs) (Show $cmdRun)
+    Check ".cmd returns exit code 0" ($cmdOut -contains "EXIT0=0") (Show $cmdRun)
+    Check ".cmd returns exit code 7" ($cmdOut -contains "EXIT7=7") (Show $cmdRun)
+    Check ".cmd reads the operator env.cmd, then setlocal restores the caller's value" ($cmdOut -contains "KEEP=before") (Show $cmdRun)
+    Check ".cmd leaves no pointer variables behind" ($cmdOut -contains "LEAK=no") (Show $cmdRun)
+
+    $psBody = @"
+`$env:OSAT_KEEP = 'before'
+function Snap { (Get-ChildItem Env: | Sort-Object Name | ForEach-Object { "`$(`$_.Name)=`$(`$_.Value)" }) -join "``n" }
+`$alias = Join-Path `$env:LOCALAPPDATA 'Programs\python$Line.ps1'
+`$before = Snap
+& `$alias (Join-Path `$PSScriptRoot 'args.py') 'a b' c 'd=e' 'f,g'
+"EXIT0=`$LASTEXITCODE"
+& `$alias (Join-Path `$PSScriptRoot 'exitcode.py') 7
+"EXIT7=`$LASTEXITCODE"
+`$after = Snap
+if (`$before -ceq `$after) { 'ENV=unchanged' } else {
+    'ENV=changed'
+    Compare-Object (`$before -split "``n") (`$after -split "``n") | ForEach-Object { "DIFF `$(`$_.SideIndicator) `$(`$_.InputObject)" }
+}
+"@
+    $psRun = Invoke-Ps $psBody
+    Capture "python$Line.ps1 under powershell.exe 5.1" (Show $psRun)
+    $psOut = @($psRun.Out -split "`r?`n")
+    Check ".ps1 passes arguments through" ($psOut -contains $expectedArgs) (Show $psRun)
+    Check ".ps1 sets `$LASTEXITCODE 0" ($psOut -contains "EXIT0=0") (Show $psRun)
+    Check ".ps1 sets `$LASTEXITCODE 7" ($psOut -contains "EXIT7=7") (Show $psRun)
+    Check ".ps1 leaves the session environment unchanged" ($psOut -contains "ENV=unchanged") (Show $psRun)
+    $psFile = Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$(Join-Path $Programs "python$Line.ps1")`" `"$(Join-Path $Work 'exitcode.py')`" 7"
+    Check ".ps1 run with -File exits 7" ($psFile.Code -eq 7) (Show $psFile)
+
+    Write-Text (Join-Path $OperatorDir "env.cmd") "set `"PYTHON_MANAGER_$($Line.Replace('.', '_'))=`"`n" -Crlf
+    Write-Text (Join-Path $OperatorDir "env.ps1") "Remove-Item Env:PYTHON_MANAGER_$($Line.Replace('.', '_')) -ErrorAction SilentlyContinue`n" -Crlf
+    $key = "PYTHON_MANAGER_" + $Line.Replace(".", "_")
+    $unsetCmd = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\python$Line.cmd`" --version`necho EXIT=%ERRORLEVEL%"
+    Capture "python$Line.cmd with $key unset" (Show $unsetCmd)
+    Check ".cmd with the key unset exits 1" (@($unsetCmd.Out -split "`r?`n") -contains "EXIT=1") (Show $unsetCmd)
+    Check ".cmd with the key unset says so" ($unsetCmd.Err.Contains("$key is not set")) (Show $unsetCmd)
+    $unsetPs = Invoke-Ps @"
+function Snap { (Get-ChildItem Env: | Sort-Object Name | ForEach-Object { "`$(`$_.Name)=`$(`$_.Value)" }) -join "``n" }
+`$before = Snap
+try { & (Join-Path `$env:LOCALAPPDATA 'Programs\python$Line.ps1') --version } catch { "CAUGHT=`$(`$_.Exception.Message)" }
+`$after = Snap
+if (`$before -ceq `$after) { 'ENV=unchanged' } else { 'ENV=changed' }
+"@
+    Capture "python$Line.ps1 with $key unset" (Show $unsetPs)
+    Check ".ps1 with the key unset stops with the message" (($unsetPs.Out + $unsetPs.Err).Contains("$key is not set")) (Show $unsetPs)
+    Check ".ps1 with the key unset still restores the environment" (@($unsetPs.Out -split "`r?`n") -contains "ENV=unchanged") (Show $unsetPs)
+    Remove-Item (Join-Path $OperatorDir "env.cmd"), (Join-Path $OperatorDir "env.ps1")
+
+    # -- [6] Which file PowerShell runs --------------------------------------------
+    Section "6 Command precedence and execution policy"
+    $which = Invoke-Ps "Get-Command python$Line -All | ForEach-Object { `"`$(`$_.CommandType) `$(`$_.Source)`" }"
+    Note "Get-Command python$Line -All (bypassed policy)" $which.Out.Trim()
+    # -ExecutionPolicy Bypass on this script sets PSExecutionPolicyPreference, which
+    # children inherit; removing it gives the child the machine's real default.
+    $default = Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -Command `"'policy: ' + (Get-ExecutionPolicy); 'picks: ' + (Get-Command python$Line).Source; python$Line --version`"" @{ PSExecutionPolicyPreference = $null }
+    Capture "default execution policy: python$Line --version" (Show $default)
+    Note "default execution policy session" ((Show $default).Trim())
+    Check "python$Line runs in a PowerShell 5.1 session with the default execution policy" ($default.Code -eq 0 -and $default.Out -match "Python $older") (Show $default)
+    $bare = Invoke-Cmd "python$Line --version"
+    Check "cmd.exe runs python$Line by its bare name" ($bare.Out -match "Python $older") (Show $bare)
+
+    # -- [7] A batch file without call ---------------------------------------------
+    Section "7 A batch file calling python$Line without call"
+    $noCall = Invoke-Cmd "python$Line `"%~dp0exitcode.py`" 3`necho CONTINUED"
+    Capture "without call" (Show $noCall)
+    Note "without call" ("continues after python: " + ($noCall.Out -match "CONTINUED") + "; exit code " + $noCall.Code)
+    $withCall = Invoke-Cmd "call python$Line `"%~dp0exitcode.py`" 3`necho CONTINUED %ERRORLEVEL%"
+    Check "with call, the batch file continues and sees exit code 3" ($withCall.Out -match "CONTINUED 3") (Show $withCall)
+
+    # -- [8] pip and venv ----------------------------------------------------------
+    Section "8 pip refuses the runtime; a venv works"
+    $offlinePip = @{ PIP_NO_INDEX = "1" }
+    $pip = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\python$Line.cmd`" -m pip install --dry-run six" $offlinePip
+    Capture "pip install into the runtime" (Show $pip)
+    Check "pip refuses to install into the runtime" ($pip.Code -ne 0 -and ($pip.Out + $pip.Err).Contains("externally-managed-environment")) (Show $pip)
+    $venv = Join-Path $Work "venv"
+    $made = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\python$Line.cmd`" -m venv `"$venv`""
+    Check "python$Line -m venv works" ($made.Code -eq 0) (Show $made)
+    $venvPython = Join-Path $venv "Scripts\python.exe"
+    $venvVersion = Invoke-Native $venvPython "--version"
+    Check "the venv runs $older" ($venvVersion.Out -match "Python $older") (Show $venvVersion)
+    $venvPip = Invoke-Native $venvPython "-m pip install --dry-run six" $offlinePip
+    Check "pip in the venv is not refused as externally managed" (-not ($venvPip.Out + $venvPip.Err).Contains("externally-managed-environment")) (Show $venvPip)
+
+    # -- [9] Switch, rename, remove, offline restore -------------------------------
+    Section "9 Switch, rename, remove and restore offline"
+    $r = Manage "--switch $newest"
+    Check "--switch $newest" ($r.Code -eq 0) (Show $r)
+    Check "python runs $newest" ((Get-CmdVersion "python") -eq $newest)
+    Check "python$Other still runs $otherVersion" ((Get-CmdVersion "python$Other") -eq $otherVersion)
+    $r = Manage "--alias python$Line=py312"
+    Check "--alias python$Line=py312" ($r.Code -eq 0) (Show $r)
+    Check "py312.cmd and py312.ps1 written" ((Test-Path (Join-Path $Programs "py312.cmd")) -and (Test-Path (Join-Path $Programs "py312.ps1")))
+    Check "python$Line.cmd and .ps1 removed" (-not (Test-Path (Join-Path $Programs "python$Line.cmd")) -and -not (Test-Path (Join-Path $Programs "python$Line.ps1")))
+    Check "py312 runs $newest (.cmd and .ps1)" ((Get-CmdVersion "py312") -eq $newest -and (Get-Ps1Version "py312") -eq $newest)
+    $r = Manage "--switch $older"
+    Check "py312 follows a switch" ($r.Code -eq 0 -and (Get-CmdVersion "py312") -eq $older) (Show $r)
+    $r = Manage "--install $newest"
+    Check "py312 follows an install and keeps its name" ($r.Code -eq 0 -and (Get-CmdVersion "py312") -eq $newest -and -not (Test-Path (Join-Path $Programs "python$Line.cmd"))) (Show $r)
+    $status = Manage "--status"
+    Capture "--status" (Show $status)
+    $statusLines = @($status.Out -split "`r?`n")
+    Check "--status starts with manage-python $Version" ($statusLines[0] -eq "manage-python $Version") $status.Out
+    Check "--status shows the rename" ($status.Out.Contains("  aliases     py312  python")) $status.Out
+    $r = Manage "--remove $newest"
+    Check "--remove refuses the default" ($r.Code -eq 1) (Show $r)
+    $r = Manage "--remove $older"
+    Check "--remove $older" ($r.Code -eq 0 -and -not (Test-Path (Join-Path $Share $older))) (Show $r)
+    Check "--status lists $older as archived" ((Manage "--status").Out -match "archived    $([regex]::Escape($older))\+") ""
+    # Windows environment names ignore case, so these also cover https_proxy and http_proxy.
+    $dead = @{ HTTPS_PROXY = "http://127.0.0.1:9"; HTTP_PROXY = "http://127.0.0.1:9" }
+    $r = Manage "--install $older" $dead
+    Capture "offline restore of $older" (Show $r)
+    Check "--install $older with the network unreachable" ($r.Code -eq 0) (Show $r)
+    $provenance = Join-Path $Share "$older\PROVENANCE"
+    Check "restored from the local archive" ((Test-Path $provenance) -and ((Get-Content $provenance) -match "^source: local archive \(")) ""
+    Check "the restored runtime runs" ((Get-CmdVersion "python") -eq $older)
+    Check "the restored runtime is protected" (Test-Path (Join-Path $Share "$older\python\Lib\EXTERNALLY-MANAGED"))
+    $mstatus = Invoke-Ps "& (Join-Path `$env:LOCALAPPDATA 'Programs\manage-python.ps1') --status; exit `$LASTEXITCODE"
+    Check "manage-python.ps1 --status exits 0" ($mstatus.Code -eq 0) (Show $mstatus)
+
+    # -- [10] The operator log -----------------------------------------------------
+    Section "10 The operator log"
+    $log = @(Log-Lines)
+    Capture "manage-python.log" ($log -join "`n")
+    $actions = @($log | ForEach-Object { ($_ -split " ")[1] })
+    Check "log actions in order" (($actions -join " ") -eq "path install install install switch alias switch install remove remove install") ($log -join "`n")
+    $failed = @($log | Where-Object { $_ -match " failed: " })
+    Check "only the refused remove failed" ($failed.Count -eq 1 -and $failed[0] -match " remove $([regex]::Escape($newest)) failed: ") ($log -join "`n")
+}
+catch {
+    Check "the validation script ran to the end" $false ($_ | Out-String)
+}
+finally {
+    $manual = @"
+
+[Manual steps: record each result here]
+  M1  New terminal from the Start menu: where.exe python; Get-Command python -All; python --version
+      result:
+  M2  cmd.exe, python REPL, Ctrl+C at the prompt, then Ctrl+C during: python -c "import time; time.sleep(30)"
+      Is "Terminate batch job (Y/N)?" shown? What happens after answering?
+      result:
+  M3  Windows PowerShell 5.1, same two Ctrl+C tests with python.ps1 (by full path if the .cmd is picked);
+      afterwards: Get-ChildItem Env:PYTHON_MANAGER* (should list nothing)
+      result:
+  M4  rundll32 sysdm.cpl,EditEnvironmentVariables  opens, and user Path shows %LOCALAPPDATA%\Programs first
+      result:
+  M5  Sign out and in: a new terminal still runs python and manage-python
+      result:
+"@
+    $elapsed = [int]([DateTime]::UtcNow - $Started).TotalSeconds
+    Say ""
+    if ($Failures.Count -eq 0) { Say "RESULT: all automated checks passed in $elapsed s. Complete the manual steps below." }
+    else { Say "RESULT: $($Failures.Count) check(s) failed in $elapsed s: $($Failures -join '; ')" }
+    $all = New-Object System.Collections.Generic.List[string]
+    $all.AddRange($Report)
+    $all.Add($manual)
+    $all.Add("")
+    $all.Add("[Captured output]")
+    $all.AddRange($Captured)
+    Write-Text $ReportPath (($all -join "`n") + "`n") -Crlf
+    Write-Host ""
+    Write-Host "Report: $ReportPath"
+}
+if ($Failures.Count -gt 0) { exit 1 }
+exit 0
