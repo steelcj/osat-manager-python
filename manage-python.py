@@ -47,6 +47,7 @@ import copy
 import gettext
 import hashlib
 import json
+import locale
 import os
 import platform
 import re
@@ -77,8 +78,18 @@ GITHUB_REPO   = "astral-sh/python-build-standalone"
 API_BASE      = f"https://api.github.com/repos/{GITHUB_REPO}"
 DOWNLOAD_BASE = f"https://github.com/{GITHUB_REPO}/releases/download"
 FLAVOR        = "install_only_stripped"
-DEFAULT_TRACK = "3.12"             # minor line for a first --install with no SPEC
 RELEASE_PAGES = 5                  # pages of 30 releases searched for a full version
+
+LOCALE_DOMAIN = COMMAND
+LOCALE_DIR    = _HERE / "locale"
+BUILTIN_LANG  = "en"               # messages are written in English, the source language
+
+# In sandbox mode (tests, smoke runs, end-to-end runs) the manager refuses to
+# change anything unless every location it writes is set explicitly and lies
+# outside the account's real home directory.
+SANDBOX_VAR          = "PYTHON_MANAGER_SANDBOX"
+POSIX_SANDBOX_VARS   = ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_BIN_HOME")
+WINDOWS_SANDBOX_VARS = ("LOCALAPPDATA", "APPDATA")
 
 DIR_MODE  = 0o700
 FILE_MODE = 0o600
@@ -96,13 +107,14 @@ ALIAS_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 KEY_RE        = re.compile(r"^PYTHON_MANAGER_[A-Z0-9_]+$")
 SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9._+-]*$")
 SHA256_RE     = re.compile(r"^[0-9a-f]{64}$")
+LANG_RE       = re.compile(r"^[A-Za-z]{2,3}(?:[_-][A-Za-z0-9]{2,8})?$")
 
 # Names Windows refuses as file names, whatever the extension.
 WINDOWS_RESERVED = {"con", "prn", "aux", "nul"} \
     | {f"com{n}" for n in range(1, 10)} | {f"lpt{n}" for n in range(1, 10)}
 
-# Messages are translated with gettext. Catalog loading arrives with --lang;
-# until then every message passes through untranslated.
+# Messages are translated with gettext; set_language() replaces this with the
+# chosen catalog before any command runs.
 _ = gettext.NullTranslations().gettext
 
 
@@ -112,6 +124,125 @@ class ManagerError(RuntimeError):
 
 class UsageError(ManagerError):
     """A command given incorrectly; the manager exits with 2."""
+
+
+# ── Language ──────────────────────────────────────────────────────────────────
+
+def normalise_lang(value: str) -> str:
+    """fr_CA.UTF-8@euro -> fr_CA; C and POSIX -> en."""
+    code = value.split(".", 1)[0].split("@", 1)[0].replace("-", "_")
+    return BUILTIN_LANG if code in ("", "C", "POSIX") else code
+
+
+def system_lang(environ: Mapping[str, str],
+                windows_ui_lang: Optional[Callable[[], Optional[str]]] = None) -> Optional[str]:
+    """The user's message language: the variables gettext itself reads on
+    POSIX, the Windows display language otherwise."""
+    for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = environ.get(var, "").split(":", 1)[0]
+        if value:
+            return normalise_lang(value)
+    probe = windows_ui_lang or _windows_ui_lang
+    return probe()
+
+
+def _windows_ui_lang() -> Optional[str]:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return None
+    name = locale.windows_locale.get(lcid)
+    return normalise_lang(name) if name else None
+
+
+def available_langs(locale_dir: Path = LOCALE_DIR) -> List[str]:
+    """English, plus every language with a compiled catalog shipped beside the manager."""
+    found = {BUILTIN_LANG}
+    if locale_dir.is_dir():
+        found |= {entry.name for entry in locale_dir.iterdir()
+                  if (entry / "LC_MESSAGES" / f"{LOCALE_DOMAIN}.mo").is_file()}
+    return sorted(found)
+
+
+def choose_lang(option: Optional[str], environ: Mapping[str, str],
+                locale_dir: Path = LOCALE_DIR,
+                windows_ui_lang: Optional[Callable[[], Optional[str]]] = None) -> Tuple[str, Optional[str]]:
+    """The language to use and, when a requested one has no catalog, a warning.
+
+    Order: --lang, then PYTHON_MANAGER_LANG, then the system locale, then
+    English. A language is matched exactly, then by its first part (fr_CA -> fr)."""
+    if option is not None and not LANG_RE.match(option):
+        raise UsageError(_("--lang takes a language code such as fr or pt_BR, not {lang!r}")
+                         .format(lang=option))
+    available = available_langs(locale_dir)
+    requests = [(option, True), (environ.get("PYTHON_MANAGER_LANG") or None, True),
+                (system_lang(environ, windows_ui_lang), False)]
+    for requested, explicit in requests:
+        if not requested:
+            continue
+        code = normalise_lang(requested)
+        for candidate in (code, code.split("_", 1)[0]):
+            if candidate in available:
+                return candidate, None
+        if explicit:
+            return BUILTIN_LANG, _("no {lang} translation is available; using English").format(lang=code)
+    return BUILTIN_LANG, None
+
+
+def set_language(lang: str, locale_dir: Path = LOCALE_DIR) -> None:
+    global _
+    if lang == BUILTIN_LANG:
+        _ = gettext.NullTranslations().gettext
+        return
+    _ = gettext.translation(LOCALE_DOMAIN, localedir=str(locale_dir), languages=[lang],
+                            fallback=True).gettext
+
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+
+def sandbox_mode() -> bool:
+    return bool(os.environ.get(SANDBOX_VAR))
+
+
+def real_home() -> Path:
+    """The account's home directory from the system, never from $HOME, which
+    a sandbox overrides."""
+    if os.name == "nt":
+        return Path(os.environ.get("USERPROFILE") or Path.home())
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _inside(path: Path, root: Path) -> bool:
+    target = os.path.realpath(str(path))
+    base = os.path.realpath(str(root))
+    return target == base or target.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def guard_path(path: Path) -> None:
+    """In sandbox mode, refuse to write anywhere inside the real home."""
+    if sandbox_mode() and _inside(path, real_home()):
+        raise ManagerError(_("sandbox mode: refusing to write {path}, which is inside your real "
+                             "home directory {home}").format(path=path, home=real_home()))
+
+
+def check_sandbox(paths: "Paths") -> None:
+    """In sandbox mode, refuse a changing command unless HOME and the XDG
+    variables (LOCALAPPDATA and APPDATA for Windows) are all set and none of
+    them, or any location derived from them, is inside the real home."""
+    if not sandbox_mode():
+        return
+    names = WINDOWS_SANDBOX_VARS if paths.windows else POSIX_SANDBOX_VARS
+    missing = [name for name in names if not paths.environ.get(name)]
+    if missing:
+        raise ManagerError(_("sandbox mode: {names} must be set to a scratch directory")
+                           .format(names=", ".join(missing)))
+    for location in [Path(paths.environ[name]) for name in names] + [
+            paths.share_dir, paths.bin_dir, paths.pointer_dir, paths.config_dir, paths.state_dir]:
+        guard_path(location)
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
@@ -265,6 +396,7 @@ def ensure_dir(path: Path, windows: bool) -> None:
     """Create a manager-owned directory with owner-only permissions, and fail
     explicitly if an existing one is broader than that. Windows directories
     inherit owner-only ACLs from the profile."""
+    guard_path(path)
     created = not path.exists()
     path.mkdir(parents=True, exist_ok=True)
     if windows:
@@ -285,6 +417,7 @@ def atomic_write_text(path: Path, text: str, *, newline: str = "\n",
     """Write `text` to a temporary file beside `path` and rename it into place,
     so a reader sees either the old file or the new one, never a partial one.
     `newline` is what each "\\n" in `text` becomes on disk."""
+    guard_path(path)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
                                     dir=str(path.parent))
     try:
@@ -318,8 +451,16 @@ def make_owner_only(root: Path) -> None:
             continue
 
 
+def make_temp_dir(parent: Path, prefix: str) -> Path:
+    """A hidden working directory beside its final location, so that moving
+    the result into place is a rename on one filesystem."""
+    guard_path(parent)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+
+
 def remove_tree(path: Path) -> None:
     """Remove a manager-owned tree, clearing read-only flags Windows sets."""
+    guard_path(path)
     def retry(function, target, _info):
         os.chmod(target, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
         function(target)
@@ -843,9 +984,15 @@ def collect_status(paths: Paths, record: PointerRecord) -> Tuple[List[LineStatus
     return lines, warnings
 
 
-def format_status(lines: List[LineStatus]) -> str:
+def manager_line(record: PointerRecord) -> str:
+    """The first line of --status: the manager's alias and the version it runs."""
+    return f"{record.alias_name(SELF)} {record.self_version or _('not installed')}"
+
+
+def format_status(lines: List[LineStatus], manager: Optional[str] = None) -> str:
+    head = f"{manager}\n\n" if manager else ""
     if not lines:
-        return _("No Python versions installed.") + "\n"
+        return head + _("No Python versions installed.") + "\n"
     labels = {"aliases": _("aliases"), "default": _("default"),
               "installed": _("installed"), "archived": _("archived")}
     width = max(len(label) for label in labels.values()) + 3
@@ -861,7 +1008,7 @@ def format_status(lines: List[LineStatus]) -> str:
         for name, indent, values in rows:
             if values:
                 out.append(f"{indent}{labels[name].ljust(width)}{'  '.join(values)}")
-    return "\n".join(out) + "\n"
+    return head + "\n".join(out) + "\n"
 
 
 # ── Aliases ───────────────────────────────────────────────────────────────────
@@ -970,6 +1117,7 @@ def write_alias(paths: Paths, slot: str, name: str,
     check_alias_writable(paths, slot, name)
     # The bin directory is shared with the distribution and other tools, so
     # it is created if absent but never made owner-only.
+    guard_path(paths.bin_dir)
     paths.bin_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for path, fmt in paths.alias_files(name):
@@ -989,6 +1137,7 @@ def remove_alias(paths: Paths, name: str) -> List[str]:
     for path, _fmt in paths.alias_files(name):
         owner = alias_owner(path)
         if owner == "ours":
+            guard_path(path)
             path.unlink()
         elif owner == "foreign":
             warnings.append(_("{path} was not written by {command}; left in place")
@@ -1099,16 +1248,34 @@ def parse_spec(spec: str) -> Tuple[str, str]:
     ).format(spec=spec))
 
 
+_ASSET_RE = re.compile(r"^cpython-(\d+\.\d+\.\d+)((?:a|b|rc)\d+)?\+(\d+)-(.+)\.tar\.gz$")
+
+
+def excluded_build(name: str) -> Optional[str]:
+    """Why a release asset is never installed, or None if it may be:
+    pre-releases (alpha, beta, rc) and free-threaded builds are excluded
+    everywhere, whatever the rest of the name says."""
+    if "freethreaded" in name:
+        return "free-threaded"
+    match = _ASSET_RE.match(name)
+    if match and match.group(2):
+        return "pre-release"
+    return None
+
+
 def builds_in_release(release: Mapping, triple: str) -> List[Build]:
-    """Every install_only_stripped build for `triple` in a release, newest first.
-    Variant triples (x86_64_v3), free-threaded and pre-release builds never match."""
-    pattern = re.compile(r"^cpython-(\d+\.\d+\.\d+)\+(\d+)-" + re.escape(triple)
-                         + "-" + re.escape(FLAVOR) + r"\.tar\.gz$")
+    """Every selectable install_only_stripped build for `triple` in a release,
+    newest first. Variant triples such as x86_64_v3 never match."""
     found = []
     for asset in release.get("assets", []):
-        match = pattern.match(asset.get("name", ""))
-        if match:
-            found.append(Build(match.group(1), match.group(2), triple))
+        name = asset.get("name", "")
+        match = _ASSET_RE.match(name)
+        if not match or excluded_build(name):
+            continue
+        version, _prerelease, build, rest = match.groups()
+        if rest != f"{triple}-{FLAVOR}":
+            continue
+        found.append(Build(version, build, triple))
     return sorted(found, key=lambda b: (version_key(b.version), int(b.build)), reverse=True)
 
 
@@ -1122,10 +1289,12 @@ def archived_build(paths: Paths, version: str, triple: str) -> Optional[Build]:
 
 
 def resolve(kind: str, value: str, triple: str, paths: Paths, net: Network,
-            track: str) -> Build:
+            track: Optional[str]) -> Build:
     """Turn an --install SPEC into one build. Pinned builds and versions
     already in the archive need no network; a minor line needs the latest
-    release; a version not in the archive searches recent releases."""
+    release; a version not in the archive searches recent releases. With no
+    SPEC, `track` is the current default's minor line, or None on a first
+    install, which takes the newest stable minor line in the latest release."""
     if kind == "pinned":
         version, build = ARCHIVE_RE.match(value).groups()  # type: ignore[union-attr]
         return Build(version, build, triple)
@@ -1146,11 +1315,13 @@ def resolve(kind: str, value: str, triple: str, paths: Paths, net: Network,
         ).format(version=value, triple=triple))
     minor = value or track
     release = net.get_json(f"{API_BASE}/releases/latest")
-    builds = [b for b in builds_in_release(release, triple) if minor_of(b.version) == minor]
+    builds = [b for b in builds_in_release(release, triple)
+              if minor is None or minor_of(b.version) == minor]
     if not builds:
         raise ManagerError(_(
-            "python-build-standalone release {tag} has no CPython {minor} for {triple}"
-        ).format(tag=release.get("tag_name", "?"), minor=minor, triple=triple))
+            "python-build-standalone release {tag} has no stable CPython {minor} for {triple} "
+            "(pre-release and free-threaded builds are not installed)"
+        ).format(tag=release.get("tag_name", "?"), minor=minor or "", triple=triple))
     return builds[0]
 
 
@@ -1269,7 +1440,7 @@ def install_runtime(build: Build, tarball: Path, sha256: str, source: str,
                     manager: Optional[str] = None) -> None:
     """Extract, health-check, protect and record a runtime in a staging
     directory, then rename it into place, so a failed install leaves nothing."""
-    staging = Path(tempfile.mkdtemp(prefix=f".staging-{build.version}-", dir=str(paths.share_dir)))
+    staging = make_temp_dir(paths.share_dir, f".staging-{build.version}-")
     try:
         extract(tarball, staging)
         health_check(paths.interpreter(staging), build.version)
@@ -1293,7 +1464,7 @@ def archive_tarball(build: Build, tarball: Path, sha256: str, source: str,
     """Keep a verified tarball, with a PROVENANCE recording its checksum."""
     ensure_dir(paths.archive_dir, paths.windows)
     entry = paths.archive_entry(build.version, build.build)
-    staging = Path(tempfile.mkdtemp(prefix=f".staging-{build.label}-", dir=str(paths.archive_dir)))
+    staging = make_temp_dir(paths.archive_dir, f".staging-{build.label}-")
     try:
         shutil.copyfile(str(tarball), str(staging / build.asset))
         write_provenance(staging, asset=build.asset, sha256=sha256, source=source,
@@ -1329,7 +1500,7 @@ def install_self(paths: Paths, source_dir: Path = _HERE,
     if target.is_dir():
         return version
     ensure_dir(paths.manager_dir, paths.windows)
-    staging = Path(tempfile.mkdtemp(prefix=f".staging-{version}-", dir=str(paths.manager_dir)))
+    staging = make_temp_dir(paths.manager_dir, f".staging-{version}-")
     try:
         for relpath in [SCRIPT_NAME] + SELF_FILES:
             destination = staging / relpath
@@ -1361,6 +1532,7 @@ def append_log(paths: Paths, action: str, target: str, result: str,
     """One line per lifecycle action: time, action, version, result."""
     try:
         ensure_dir(paths.state_dir, paths.windows)
+        guard_path(paths.log_file)
         line = " ".join([utc_timestamp(now), action, target or "-",
                          " ".join(result.split())])
         with open(paths.log_file, "a", encoding="utf-8") as handle:
@@ -1377,7 +1549,7 @@ def append_log(paths: Paths, action: str, target: str, result: str,
 def cmd_status(paths: Paths) -> int:
     record = read_pointer(paths)
     lines, warnings = collect_status(paths, record)
-    sys.stdout.write(format_status(lines))
+    sys.stdout.write(format_status(lines, manager_line(record)))
     for warning in warnings:
         log(_("warning: {message}").format(message=warning))
     return 0
@@ -1388,15 +1560,23 @@ def cmd_install(spec: str, paths: Paths, net: Network, triple: Optional[str] = N
                 now: Optional[datetime] = None) -> str:
     """Install a runtime and switch to it; install the manager itself on first
     use. Aliases are checked before any network access. Returns the version."""
+    check_sandbox(paths)
     kind, value = parse_spec(spec)
     record = read_pointer(paths)
-    track = minor_of(record.default) if record.default else DEFAULT_TRACK
-    minor = {"track": track, "minor": value}.get(kind) or minor_of(value.split("+")[0])
+    track = minor_of(record.default) if record.default else None
+    if kind == "track":
+        minor = track
+    elif kind == "minor":
+        minor = value
+    else:
+        minor = minor_of(value.split("+")[0])
 
     plan = record.copy()
     install_manager = not (plan.self_version and (paths.manager_dir / plan.self_version).is_dir())
     # Every alias this install will write, checked before any network access.
-    slots = [DEFAULT, minor, SELF] + [s for s in plan.active_slots() if s not in (DEFAULT, minor, SELF)]
+    # Only a first install with no SPEC learns its minor line from the release.
+    slots = [DEFAULT, SELF] + ([minor] if minor else []) + [
+        s for s in plan.active_slots() if s not in (DEFAULT, SELF, minor)]
     for slot in slots:
         check_alias_name(plan.alias_name(slot), slot)
         check_alias_writable(paths, slot, plan.alias_name(slot))
@@ -1404,12 +1584,16 @@ def cmd_install(spec: str, paths: Paths, net: Network, triple: Optional[str] = N
     triple = triple or detect_triple()
     build = resolve(kind, value, triple, paths, net, track)
     log(_("selected CPython {label} ({triple})").format(label=build.label, triple=triple))
+    if minor is None:
+        minor = minor_of(build.version)
+        check_alias_name(plan.alias_name(minor), minor)
+        check_alias_writable(paths, minor, plan.alias_name(minor))
 
     ensure_dir(paths.share_dir, paths.windows)
     if paths.runtime_dir(build.version).is_dir():
         log(_("{version} is already installed").format(version=build.version))
     else:
-        workdir = Path(tempfile.mkdtemp(prefix=".download-", dir=str(paths.share_dir)))
+        workdir = make_temp_dir(paths.share_dir, ".download-")
         try:
             tarball, sha256, source, from_archive = acquire(build, paths, net, workdir)
             log(_("installing to {path}...").format(path=paths.display(paths.runtime_dir(build.version))))
@@ -1430,19 +1614,85 @@ def cmd_install(spec: str, paths: Paths, net: Network, triple: Optional[str] = N
     write_aliases(paths, plan, plan.active_slots(), templates_dir)
     log(_("CPython {version} installed; python and {alias} now run it")
         .format(version=build.version, alias=plan.alias_name(minor)))
+    if paths.windows:
+        add_to_windows_user_path(paths)
     path_notes(paths)
     return build.version
 
 
+# ── Windows user PATH ─────────────────────────────────────────────────────────
+
+WINDOWS_BIN_ENTRY = r"%LOCALAPPDATA%\Programs"
+REG_SZ, REG_EXPAND_SZ = 1, 2                    # winreg's value types, for tests off Windows
+
+
+def expand_windows_vars(text: str, environ: Mapping[str, str]) -> str:
+    """%NAME% expansion as Windows does it: case-insensitive, unknown names kept."""
+    folded = {key.upper(): value for key, value in environ.items()}
+    return re.sub(r"%([^%;]+)%", lambda m: folded.get(m.group(1).upper(), m.group(0)), text)
+
+
+def _path_key(entry: str, environ: Mapping[str, str]) -> str:
+    expanded = expand_windows_vars(entry.strip().strip('"'), environ)
+    return expanded.replace("/", "\\").rstrip("\\").casefold()
+
+
+def prepend_path_entry(current: str, value_type: int, environ: Mapping[str, str]) -> Optional[str]:
+    """The user Path with %LOCALAPPDATA%\\Programs first, or None if it is
+    already there in any spelling. A REG_EXPAND_SZ value gets the entry
+    unexpanded; a REG_SZ value cannot expand it, so it gets the expanded path."""
+    target = _path_key(WINDOWS_BIN_ENTRY, environ)
+    entries = [e for e in current.split(";") if e.strip()]
+    if any(_path_key(e, environ) == target for e in entries):
+        return None
+    entry = WINDOWS_BIN_ENTRY if value_type == REG_EXPAND_SZ else \
+        expand_windows_vars(WINDOWS_BIN_ENTRY, environ)
+    return ";".join([entry] + entries)
+
+
+def _broadcast_environment_change() -> None:
+    """Tell Explorer and other top-level windows that the environment changed,
+    so terminals opened afterwards see the new Path."""
+    import ctypes
+    from ctypes import wintypes
+    result = wintypes.DWORD()
+    ctypes.windll.user32.SendMessageTimeoutW(  # type: ignore[attr-defined]
+        0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, ctypes.byref(result))
+
+
+def add_to_windows_user_path(paths: Paths, registry=None,
+                             broadcast: Optional[Callable[[], None]] = None) -> bool:
+    """Prepend %LOCALAPPDATA%\\Programs to HKCU\\Environment Path, keeping its
+    value type, unless it is already there. Returns True if Path changed."""
+    if sandbox_mode():
+        log(_("sandbox mode: the Windows user PATH is not changed"))
+        return False
+    if registry is None:
+        import winreg as registry  # type: ignore[import-not-found,no-redef]
+    with registry.OpenKey(registry.HKEY_CURRENT_USER, "Environment", 0,
+                          registry.KEY_READ | registry.KEY_WRITE) as key:
+        try:
+            current, value_type = registry.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            current, value_type = "", registry.REG_EXPAND_SZ
+        if value_type not in (registry.REG_SZ, registry.REG_EXPAND_SZ):
+            raise ManagerError(_("HKCU\\Environment Path has an unexpected type; add {entry} by hand")
+                               .format(entry=WINDOWS_BIN_ENTRY))
+        updated = prepend_path_entry(current, value_type, paths.environ)
+        if updated is None:
+            return False
+        registry.SetValueEx(key, "Path", 0, value_type, updated)
+    (broadcast or _broadcast_environment_change)()
+    log(_("added {entry} to the start of your user PATH; open a new terminal to use it")
+        .format(entry=WINDOWS_BIN_ENTRY))
+    return True
+
+
 def path_notes(paths: Paths) -> None:
     entries = [Path(p) for p in paths.environ.get("PATH", "").split(os.pathsep) if p]
-    if paths.bin_dir in entries:
+    if paths.bin_dir in entries or paths.windows:
         return
-    if paths.windows:
-        log(_("{path} is not on your PATH. Add it to the user PATH, ahead of "
-              "%LOCALAPPDATA%\\Microsoft\\WindowsApps, and open a new terminal")
-            .format(path=paths.display(paths.bin_dir)))
-    elif platform.system() == "Darwin":
+    if platform.system() == "Darwin":
         log(_("{path} is not on your PATH. Add this line to ~/.zshrc and open a new terminal:\n"
               "    export PATH=\"$HOME/.local/bin:$PATH\"").format(path=paths.display(paths.bin_dir)))
     else:
@@ -1451,6 +1701,7 @@ def path_notes(paths: Paths) -> None:
 
 
 def cmd_switch(version: str, paths: Paths, templates_dir: Path = TEMPLATES_DIR) -> str:
+    check_sandbox(paths)
     if not VERSION_RE.match(version):
         raise UsageError(_("--switch takes a full version such as 3.12.14, not {version!r}")
                          .format(version=version))
@@ -1470,6 +1721,7 @@ def cmd_switch(version: str, paths: Paths, templates_dir: Path = TEMPLATES_DIR) 
 
 
 def cmd_remove(version: str, paths: Paths) -> str:
+    check_sandbox(paths)
     if not VERSION_RE.match(version):
         raise UsageError(_("--remove takes a full version such as 3.12.13, not {version!r}")
                          .format(version=version))
@@ -1500,7 +1752,7 @@ def cmd_remove(version: str, paths: Paths) -> str:
             log(_("warning: {message}").format(message=warning))
     log(_("virtual environments created with {version} stop working until it is reinstalled")
         .format(version=version))
-    trash = Path(tempfile.mkdtemp(prefix=f".removing-{version}-", dir=str(paths.share_dir)))
+    trash = make_temp_dir(paths.share_dir, f".removing-{version}-")
     os.rename(str(runtime), str(trash / version))
     remove_tree(trash)
     log(_("{version} removed").format(version=version)
@@ -1515,6 +1767,7 @@ def cmd_remove(version: str, paths: Paths) -> str:
 def cmd_alias(spec: str, paths: Paths, templates_dir: Path = TEMPLATES_DIR) -> str:
     """Rename an alias. OLD is its current name, or, for an alias not yet
     written, its default name, so a collision can be avoided before an install."""
+    check_sandbox(paths)
     old, sep, new = spec.partition("=")
     if not sep or not old or not new:
         raise UsageError(_("--alias takes OLD=NEW, for example python3.12=py312"))
@@ -1566,7 +1819,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--install", nargs="?", const="", metavar="SPEC",
                          help=_("Install and switch to a runtime: 3.13, 3.12.14 or 3.12.14+20260924 "
-                                "(default: latest of the default minor line)."))
+                                "(default: latest of the default's minor line, or the newest "
+                                "stable minor line on a first install)."))
     actions.add_argument("--switch", metavar="VERSION",
                          help=_("Make an installed version the one python and its minor alias run."))
     actions.add_argument("--status", action="store_true",
@@ -1577,7 +1831,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                          help=_("Rename an alias, for example python3.12=py312."))
     actions.add_argument("--version", action="store_true",
                          help=_("Show this manager's version and exit."))
+    parser.add_argument("--lang", metavar="LANG",
+                        help=_("Language for this command's messages, for example fr."))
     args = parser.parse_args(argv)
+
+    try:
+        lang, warning = choose_lang(args.lang, os.environ)
+    except UsageError as error:
+        log(_("ERROR: {message}").format(message=error))
+        return 2
+    set_language(lang)
+    if warning:
+        log(_("warning: {message}").format(message=warning))
 
     if args.version:
         print(f"{COMMAND} {manager_version()}")

@@ -1,12 +1,15 @@
-# install.ps1 -- no-Python bootstrap for python-tool on Windows.
+# install.ps1 -- no-Python bootstrap for osat-manager-python on Windows.
 #
-# install-python.py is itself a Python script, so it can't be the first
+# manage-python.py is itself a Python script, so it can't be the first
 # thing that runs on a machine with no Python at all. This script exists
 # to solve exactly that, and only that. It does not reimplement the real
 # install: it fetches a small, pinned, checksum-verified, disposable
-# CPython build, uses it once to run install-python.py, then deletes it.
+# CPython build, uses it once to run manage-python.py, then deletes it.
 # The permanent, governed, checksum-verified install still comes entirely
-# from install-python.py's own release lookup.
+# from manage-python.py's own release lookup. manage-python.py also
+# installs itself and adds %LOCALAPPDATA%\Programs to the user PATH, so
+# afterwards `manage-python` runs from any new terminal on the runtime it
+# installed, and this bootstrap is no longer needed.
 #
 # Requires only curl.exe and tar.exe, both bundled unconditionally in
 # Windows 10 (1803+) and Windows 11. Note: in Windows PowerShell 5.1,
@@ -19,15 +22,15 @@
 # and PowerShell behavior, but treat it as unverified until tested.
 #
 # Usage:
-#   .\install.ps1
-#   .\install.ps1 --track 3.11
+#   .\install.ps1                  same as .\install.ps1 --install
+#   .\install.ps1 --install 3.13   any manage-python.py arguments, passed through
 #   (If PowerShell blocks the script: powershell -ExecutionPolicy Bypass -File .\install.ps1)
 
 $ErrorActionPreference = "Stop"
 
 # Pinned bootstrap release. This intentionally does NOT look up "latest"
 # from the GitHub API: the bootstrap Python is disposable and only needs
-# to be capable of running install-python.py, which does its own, current,
+# to be capable of running manage-python.py, which does its own, current,
 # checksum-verified release lookup for the real, permanent install.
 $BootstrapTag = "20250828"
 $BootstrapBaseUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$BootstrapTag"
@@ -43,11 +46,11 @@ function Log($message) {
     Write-Host "[install.ps1] $message"
 }
 
-# Refuse Administrator, same as install-python.py: this is strictly a
+# Refuse Administrator, same as manage-python.py: this is strictly a
 # user-space tool.
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) {
-    Fail "refusing to run as Administrator. python-tool installs entirely in user-space under `$env:LOCALAPPDATA."
+    Fail "refusing to run as Administrator. osat-manager-python installs entirely in user-space under `$env:LOCALAPPDATA."
 }
 
 if (-not $env:PROCESSOR_ARCHITECTURE -or $env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
@@ -62,12 +65,19 @@ if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$InstallPy = Join-Path $ScriptDir "install-python.py"
-if (-not (Test-Path $InstallPy)) {
-    Fail "install-python.py not found next to this script at $InstallPy. Check out the full repository, not just this file."
+$ManagePy = Join-Path $ScriptDir "manage-python.py"
+foreach ($Required in @("manage-python.py", "VERSION", "scripts\windows\alias.cmd.template",
+                        "scripts\windows\alias.ps1.template", "scripts\windows\manager-alias.cmd.template",
+                        "scripts\windows\manager-alias.ps1.template")) {
+    if (-not (Test-Path (Join-Path $ScriptDir $Required))) {
+        Fail "$Required not found next to this script in $ScriptDir. Download the full release, not just this file."
+    }
 }
 
-$TmpDir = Join-Path $env:TEMP "python-tool-bootstrap-$(Get-Random)"
+# With no arguments, install: the latest stable CPython and the manager itself.
+if ($args.Count -gt 0) { $ManagerArgs = $args } else { $ManagerArgs = @("--install") }
+
+$TmpDir = Join-Path $env:TEMP "osat-manager-python-bootstrap-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir | Out-Null
 
 try {
@@ -97,8 +107,8 @@ try {
         Fail "expected interpreter not found after extraction: $BootstrapPython"
     }
 
-    Log "bootstrap Python ready. Handing off to install-python.py for the real, verified install..."
-    & $BootstrapPython $InstallPy @args
+    Log "bootstrap Python ready. Handing off to manage-python.py for the real, verified install..."
+    & $BootstrapPython $ManagePy @ManagerArgs
     $Status = $LASTEXITCODE
 
     Log "done (bootstrap Python will now be cleaned up; it was never the permanent install)."

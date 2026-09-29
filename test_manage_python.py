@@ -3,15 +3,21 @@
 """
 test_manage_python.py, offline unit tests for manage-python.py.
 
-Covers the parts that need no downloads: the pointer file and alias record,
-PROVENANCE, platform triple selection, status output, and alias rendering
-with its ownership check. Every test works in a scratch directory; nothing
-touches the real home directory or the network.
+Covers the pointer file and alias record, PROVENANCE, platform triple
+selection, status output, alias rendering and ownership, language selection,
+the Windows PATH logic, and --install, --switch, --remove and --alias through
+a fake network.
+
+Isolation: before anything else, this module turns on the manager's sandbox
+mode and points HOME, the XDG variables, LOCALAPPDATA and APPDATA at a
+scratch directory, so neither a test nor main() can write into the real home.
+Every test also works in its own scratch directory.
 
 Usage:
     python3 -m unittest test_manage_python -v
 """
 
+import atexit
 import hashlib
 import importlib.util
 import io
@@ -28,6 +34,22 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+
+# ── Isolation, before the manager is loaded ──────────────────────────────────
+
+_SANDBOX = Path(tempfile.mkdtemp(prefix="manage-python-sandbox-"))
+atexit.register(shutil.rmtree, str(_SANDBOX), True)
+os.environ.update({
+    "PYTHON_MANAGER_SANDBOX": "1",
+    "HOME": str(_SANDBOX / "home"),
+    "XDG_DATA_HOME": str(_SANDBOX / "data"),
+    "XDG_CONFIG_HOME": str(_SANDBOX / "config"),
+    "XDG_STATE_HOME": str(_SANDBOX / "state"),
+    "XDG_BIN_HOME": str(_SANDBOX / "bin"),
+    "LOCALAPPDATA": str(_SANDBOX / "local"),
+    "APPDATA": str(_SANDBOX / "roaming"),
+})
+os.environ.pop("PYTHON_MANAGER_LANG", None)
 
 _SCRIPT = Path(__file__).resolve().parent / "manage-python.py"
 _spec = importlib.util.spec_from_file_location("manage_python", _SCRIPT)
@@ -690,7 +712,7 @@ class TestStatus(Scratch):
              redirect_stdout(out), redirect_stderr(err):
             code = mp.main(["--status"])
         self.assertEqual(code, 0)
-        self.assertEqual(out.getvalue(), PROPOSAL_STATUS)
+        self.assertEqual(out.getvalue(), "manage-python not installed\n\n" + PROPOSAL_STATUS)
         self.assertIn("[manage-python] warning:", err.getvalue())
 
     def test_cli_status_reports_a_broken_pointer(self):
@@ -1285,7 +1307,7 @@ class TestReleaseLookup(Lifecycle):
         self.publish("3.12.14+20260924")
         with self.assertRaisesRegex(mp.ManagerError, "3.11.2"):
             mp.resolve("version", "3.11.2", TRIPLE, self.paths, self.net, "3.12")
-        with self.assertRaisesRegex(mp.ManagerError, "no CPython 3.9"):
+        with self.assertRaisesRegex(mp.ManagerError, "no stable CPython 3.9"):
             mp.resolve("minor", "3.9", TRIPLE, self.paths, self.net, "3.12")
 
     def test_parse_sha256sums(self):
@@ -1345,7 +1367,7 @@ class TestInstall(Lifecycle):
     def test_minor_line_install_moves_python_and_keeps_other_lines(self):
         self.publish("3.12.14+20260924")
         self.publish("3.13.15+20260924")
-        self.install()
+        self.install("3.12")
         self.assertEqual(self.install("3.13"), "3.13.15")
         record = self.pointer()
         self.assertEqual(record.default, "3.13.15")
@@ -1466,7 +1488,7 @@ class TestInstall(Lifecycle):
     def test_later_install_keeps_the_manager_version(self):
         self.publish("3.12.14+20260924")
         self.publish("3.13.15+20260924")
-        self.install()
+        self.install("3.12")
         self.make_source("0.4.0")
         self.install("3.13")
         self.assertEqual(self.pointer().self_version, "0.3.0")
@@ -1688,6 +1710,401 @@ class TestMainLifecycle(InstalledSet):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(self.run_main("--status"), 0)
         self.assertFalse(self.paths.log_file.exists())
+
+
+# ── Sandbox isolation ─────────────────────────────────────────────────────────
+
+class TestSandbox(Lifecycle):
+    """A fake real home stands in for the account's home directory, so every
+    refusal can be checked without going near the real one."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_home = self.tmp / "realhome"
+        patcher = mock.patch.object(mp, "real_home", return_value=self.fake_home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def home_env(self):
+        home = self.fake_home
+        return {"HOME": str(home), "XDG_DATA_HOME": str(home / ".local/share"),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "XDG_STATE_HOME": str(home / ".local/state"),
+                "XDG_BIN_HOME": str(home / ".local/bin")}
+
+    def test_this_module_runs_in_a_scratch_home(self):
+        real = Path(__import__("pwd").getpwuid(os.getuid()).pw_dir) if os.name != "nt" \
+            else Path(os.environ.get("USERPROFILE", ""))
+        self.assertTrue(mp.sandbox_mode())
+        for name in mp.POSIX_SANDBOX_VARS + mp.WINDOWS_SANDBOX_VARS:
+            self.assertFalse(mp._inside(Path(os.environ[name]), real), name)
+
+    def test_refuses_missing_variables(self):
+        paths = mp.Paths(windows=False, environ={"HOME": str(self.tmp)}, home=self.tmp)
+        with self.assertRaisesRegex(mp.ManagerError, "XDG_DATA_HOME, XDG_CONFIG_HOME"):
+            mp.check_sandbox(paths)
+        paths = mp.Paths(windows=True, environ={"LOCALAPPDATA": str(self.tmp)}, home=self.tmp)
+        with self.assertRaisesRegex(mp.ManagerError, "APPDATA must be set"):
+            mp.check_sandbox(paths)
+
+    def test_refuses_locations_in_the_real_home(self):
+        paths = mp.Paths(windows=False, environ=self.home_env(), home=self.fake_home)
+        for command in (lambda: mp.cmd_switch("3.12.14", paths),
+                        lambda: mp.cmd_remove("3.12.14", paths),
+                        lambda: mp.cmd_alias("python=py", paths),
+                        lambda: mp.cmd_install("3.12.14+20260924", paths, self.net, triple=TRIPLE,
+                                               source_dir=self.source)):
+            with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+                command()
+        self.assertFalse(self.fake_home.exists())
+        self.assertEqual(self.net.calls, [])
+
+    def test_one_stray_variable_is_enough(self):
+        env = dict(self.env, XDG_STATE_HOME=str(self.fake_home / ".local/state"))
+        paths = mp.Paths(windows=False, environ=env, home=self.home)
+        with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+            mp.cmd_alias("python=py", paths)
+
+    def test_write_primitives_refuse_the_real_home(self):
+        target = self.fake_home / "x"
+        for write in (lambda: mp.atomic_write_text(target, "x"),
+                      lambda: mp.ensure_dir(target, False),
+                      lambda: mp.make_temp_dir(self.fake_home, ".t-"),
+                      lambda: mp.remove_tree(target)):
+            with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+                write()
+        self.assertFalse(self.fake_home.exists())
+
+    def test_the_stray_log_line_cannot_happen_again(self):
+        """Last session: a smoke run of a failing --switch wrote a log line
+        into the real ~/.local/state. The same run now writes nothing there."""
+        paths = mp.Paths(windows=False, environ=self.home_env(), home=self.fake_home)
+        with mock.patch.object(mp, "Paths", return_value=paths):
+            self.assertEqual(mp.main(["--switch", "3.12.14"]), 1)
+            mp.append_log(paths, "switch", "3.12.14", "failed")
+        self.assertFalse(self.fake_home.exists())
+        self.assertIn("sandbox mode", self.err.getvalue())
+
+    def test_symlink_into_the_real_home_is_refused(self):
+        self.fake_home.mkdir()
+        link = self.tmp / "looks-like-scratch"
+        link.symlink_to(self.fake_home)
+        with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+            mp.atomic_write_text(link / "pointer", "x")
+        self.assertEqual(os.listdir(self.fake_home), [])
+
+    def test_inactive_outside_sandbox_mode(self):
+        with mock.patch.dict(os.environ, {"PYTHON_MANAGER_SANDBOX": ""}):
+            self.assertFalse(mp.sandbox_mode())
+            mp.guard_path(self.fake_home / "x")
+            mp.check_sandbox(mp.Paths(windows=False, environ={}, home=self.fake_home))
+
+    def test_windows_registry_is_never_touched_in_sandbox_mode(self):
+        class Untouchable:
+            def __getattr__(self, name):
+                raise AssertionError("registry used in sandbox mode")
+        self.assertFalse(mp.add_to_windows_user_path(self.windows_paths(), registry=Untouchable()))
+
+
+# ── Release selection: pre-release and free-threaded builds ───────────────────
+
+class TestReleaseExclusions(Lifecycle):
+
+    NAMES = [
+        "cpython-3.15.0a1+20260924-{t}-install_only_stripped.tar.gz",
+        "cpython-3.15.0b2+20260924-{t}-install_only_stripped.tar.gz",
+        "cpython-3.15.0rc1+20260924-{t}-install_only_stripped.tar.gz",
+        "cpython-3.14.2+20260924-{t}-freethreaded-install_only_stripped.tar.gz",
+        "cpython-3.14.2+20260924-{t}-freethreaded+pgo+lto-install_only_stripped.tar.gz",
+        "cpython-3.14.2+20260924-{t}-install_only_stripped-freethreaded.tar.gz",
+        "cpython-3.14.1+20260924-{t}-install_only_stripped.tar.gz",
+        "cpython-3.13.9+20260924-{t}-install_only_stripped.tar.gz",
+    ]
+
+    def release(self):
+        return {"tag_name": "20260924",
+                "assets": [{"name": n.format(t=TRIPLE)} for n in self.NAMES]}
+
+    def test_exclusion_rule(self):
+        for name, reason in (
+                ("cpython-3.15.0a1+20260924-x-install_only_stripped.tar.gz", "pre-release"),
+                ("cpython-3.15.0b2+20260924-x-install_only.tar.gz", "pre-release"),
+                ("cpython-3.15.0rc1+20260924-x-install_only_stripped.tar.gz", "pre-release"),
+                ("cpython-3.14.2+20260924-x-freethreaded-install_only_stripped.tar.gz", "free-threaded"),
+                ("cpython-3.14.2+20260924-freethreaded-x-install_only_stripped.tar.gz", "free-threaded"),
+                ("cpython-3.15.0rc1+20260924-x-freethreaded.tar.gz", "free-threaded"),
+                ("cpython-3.14.1+20260924-x-install_only_stripped.tar.gz", None)):
+            with self.subTest(name=name):
+                self.assertEqual(mp.excluded_build(name), reason)
+
+    def test_pre_releases_are_never_selected(self):
+        versions = [b.version for b in mp.builds_in_release(self.release(), TRIPLE)]
+        self.assertFalse(any(v.startswith("3.15") for v in versions))
+
+    def test_free_threaded_builds_are_never_selected(self):
+        self.assertEqual([b.label for b in mp.builds_in_release(self.release(), TRIPLE)],
+                         ["3.14.1+20260924", "3.13.9+20260924"])
+
+    def serve(self):
+        self.net.releases["20260924"] = self.release()
+
+    def test_first_install_takes_the_newest_stable_minor_line(self):
+        self.serve()
+        build = mp.resolve("track", "", TRIPLE, self.paths, self.net, None)
+        self.assertEqual(build.label, "3.14.1+20260924")
+
+    def test_minor_line_with_only_pre_releases_is_refused(self):
+        self.serve()
+        with self.assertRaisesRegex(mp.ManagerError, "no stable CPython 3.15.*pre-release"):
+            mp.resolve("minor", "3.15", TRIPLE, self.paths, self.net, None)
+
+    def test_version_search_skips_pre_releases(self):
+        self.serve()
+        with self.assertRaises(mp.ManagerError):
+            mp.resolve("version", "3.15.0", TRIPLE, self.paths, self.net, None)
+
+    def test_spec_cannot_name_a_pre_release(self):
+        for spec in ("3.15.0a1", "3.15.0rc1+20260924"):
+            with self.subTest(spec=spec), self.assertRaises(mp.UsageError):
+                mp.parse_spec(spec)
+
+    def test_first_install_end_to_end(self):
+        self.publish("3.13.15+20260924")
+        self.publish("3.14.1+20260924")
+        self.net.releases["20260924"]["assets"].append(
+            {"name": f"cpython-3.15.0rc1+20260924-{TRIPLE}-install_only_stripped.tar.gz"})
+        self.assertEqual(self.install(), "3.14.1")
+        self.assertTrue((self.paths.bin_dir / "python3.14").exists())
+
+    def test_first_install_checks_the_line_alias_before_downloading(self):
+        self.publish("3.14.1+20260924")
+        self.paths.bin_dir.mkdir(parents=True)
+        (self.paths.bin_dir / "python3.14").write_text("not ours\n")
+        with self.assertRaisesRegex(mp.ManagerError, "--alias python3.14=<new-name>"):
+            self.install()
+        self.assertEqual(self.net.calls, [f"{mp.API_BASE}/releases/latest"])
+
+
+# ── Windows user PATH ─────────────────────────────────────────────────────────
+
+class FakeRegistry:
+    """The parts of winreg the manager uses, over one in-memory Path value."""
+
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE = "HKCU", 1, 2
+    REG_SZ, REG_EXPAND_SZ, REG_DWORD = mp.REG_SZ, mp.REG_EXPAND_SZ, 4
+
+    def __init__(self, value=None):
+        self.value = value                      # (data, type) or None
+        self.writes = []
+
+    class _Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def OpenKey(self, root, name, reserved, access):
+        assert (root, name, access) == ("HKCU", "Environment", 3)
+        return self._Key()
+
+    def QueryValueEx(self, key, name):
+        if self.value is None:
+            raise FileNotFoundError(name)
+        return self.value
+
+    def SetValueEx(self, key, name, reserved, value_type, data):
+        self.writes.append((name, value_type, data))
+        self.value = (data, value_type)
+
+
+class TestWindowsPath(Scratch):
+
+    ENV = {"LOCALAPPDATA": r"C:\Users\ann\AppData\Local", "USERPROFILE": r"C:\Users\ann"}
+
+    def prepend(self, current, value_type=mp.REG_EXPAND_SZ):
+        return mp.prepend_path_entry(current, value_type, self.ENV)
+
+    def test_prepends_when_absent(self):
+        self.assertEqual(self.prepend(r"%USERPROFILE%\bin;C:\tools"),
+                         r"%LOCALAPPDATA%\Programs;%USERPROFILE%\bin;C:\tools")
+        self.assertEqual(self.prepend(""), r"%LOCALAPPDATA%\Programs")
+
+    def test_reg_sz_gets_the_expanded_path(self):
+        self.assertEqual(self.prepend(r"C:\tools", mp.REG_SZ),
+                         r"C:\Users\ann\AppData\Local\Programs;C:\tools")
+
+    def test_already_present_in_any_spelling(self):
+        for current in (r"%LOCALAPPDATA%\Programs", r"%localappdata%\programs\;C:\x",
+                        r"C:\x;C:\Users\ann\AppData\Local\Programs",
+                        r"C:\x; c:/users/ANN/appdata/local/programs/ ",
+                        r'"C:\Users\ann\AppData\Local\Programs"'):
+            with self.subTest(current=current):
+                self.assertIsNone(self.prepend(current))
+
+    def test_similar_entries_are_not_mistaken_for_it(self):
+        for current in (r"C:\Users\ann\AppData\Local\Programs\Python",
+                        r"%LOCALAPPDATA%\Microsoft\WindowsApps", r"%OTHER%\Programs"):
+            with self.subTest(current=current):
+                self.assertIsNotNone(self.prepend(current))
+
+    def test_expand_windows_vars(self):
+        self.assertEqual(mp.expand_windows_vars(r"%LocalAppData%\x;%NOPE%\y", self.ENV),
+                         r"C:\Users\ann\AppData\Local\x;%NOPE%\y")
+
+    def outside_sandbox(self):
+        patcher = mock.patch.dict(os.environ, {"PYTHON_MANAGER_SANDBOX": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return mp.Paths(windows=True, environ=self.ENV, home=self.home)
+
+    def test_registry_write_keeps_the_value_type(self):
+        paths = self.outside_sandbox()
+        for value_type in (mp.REG_SZ, mp.REG_EXPAND_SZ):
+            registry, broadcasts = FakeRegistry((r"C:\tools", value_type)), []
+            with redirect_stderr(io.StringIO()):
+                self.assertTrue(mp.add_to_windows_user_path(paths, registry,
+                                                            lambda: broadcasts.append(1)))
+            self.assertEqual(registry.writes[0][1], value_type)
+            self.assertTrue(registry.writes[0][2].endswith(r"\Programs;C:\tools"))
+            self.assertEqual(broadcasts, [1])
+
+    def test_missing_path_is_created_expandable(self):
+        registry = FakeRegistry(None)
+        with redirect_stderr(io.StringIO()):
+            mp.add_to_windows_user_path(self.outside_sandbox(), registry, lambda: None)
+        self.assertEqual(registry.writes, [("Path", mp.REG_EXPAND_SZ, r"%LOCALAPPDATA%\Programs")])
+
+    def test_present_means_no_write_and_no_broadcast(self):
+        registry, broadcasts = FakeRegistry((r"%LOCALAPPDATA%\Programs;C:\x", mp.REG_EXPAND_SZ)), []
+        self.assertFalse(mp.add_to_windows_user_path(self.outside_sandbox(), registry,
+                                                     lambda: broadcasts.append(1)))
+        self.assertEqual((registry.writes, broadcasts), ([], []))
+
+    def test_unexpected_type_is_refused(self):
+        registry = FakeRegistry((1, FakeRegistry.REG_DWORD))
+        with self.assertRaisesRegex(mp.ManagerError, "unexpected type"):
+            mp.add_to_windows_user_path(self.outside_sandbox(), registry, lambda: None)
+        self.assertEqual(registry.writes, [])
+
+
+# ── --status: the manager line ────────────────────────────────────────────────
+
+class TestStatusManagerLine(InstalledSet):
+
+    def run_status(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            mp.cmd_status(self.paths)
+        return out.getvalue()
+
+    def test_first_line_names_the_manager_and_its_version(self):
+        self.assertTrue(self.run_status().startswith("manage-python 0.3.0\n\n3.12\n"))
+
+    def test_renamed_manager(self):
+        mp.cmd_alias("manage-python=mp", self.paths)
+        self.assertTrue(self.run_status().startswith("mp 0.3.0\n\n"))
+
+    def test_before_any_install(self):
+        self.assertEqual(mp.format_status([], mp.manager_line(mp.PointerRecord())),
+                         "manage-python not installed\n\nNo Python versions installed.\n")
+
+
+# ── Language selection ────────────────────────────────────────────────────────
+
+def write_mo(path, messages):
+    """A compiled gettext catalog, laid out as msgfmt writes one."""
+    messages = dict(messages, **{"": "Content-Type: text/plain; charset=UTF-8\n"})
+    keys = sorted(messages)
+    ids = strs = b""
+    table = []
+    for key in keys:
+        k, v = key.encode(), messages[key].encode()
+        table.append((len(ids), len(k), len(strs), len(v)))
+        ids += k + b"\0"
+        strs += v + b"\0"
+    count = len(keys)
+    key_start = 7 * 4 + 16 * count
+    value_start = key_start + len(ids)
+    offsets = []
+    for id_off, id_len, _s_off, _s_len in table:
+        offsets += [id_len, id_off + key_start]
+    for _i_off, _i_len, s_off, s_len in table:
+        offsets += [s_len, s_off + value_start]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<7I", 0x950412DE, 0, count, 7 * 4, 7 * 4 + count * 8, 0, 0)
+                     + struct.pack(f"<{len(offsets)}I", *offsets) + ids + strs)
+
+
+class TestLanguage(Scratch):
+
+    FRENCH = {"No Python versions installed.": "Aucune version de Python installée.",
+              "default": "par défaut"}
+
+    def setUp(self):
+        super().setUp()
+        self.locale = self.tmp / "locale"
+        write_mo(self.locale / "fr" / "LC_MESSAGES" / "manage-python.mo", self.FRENCH)
+        self.addCleanup(mp.set_language, "en")
+
+    def choose(self, option=None, **env):
+        return mp.choose_lang(option, env, self.locale, windows_ui_lang=lambda: None)
+
+    def test_order_option_then_variable_then_system_then_english(self):
+        self.assertEqual(self.choose("fr", PYTHON_MANAGER_LANG="en", LANG="en_US.UTF-8"), ("fr", None))
+        self.assertEqual(self.choose(None, PYTHON_MANAGER_LANG="fr", LANG="en_US.UTF-8"), ("fr", None))
+        self.assertEqual(self.choose("en", PYTHON_MANAGER_LANG="fr"), ("en", None))
+        self.assertEqual(self.choose(None, LANG="fr_FR.UTF-8"), ("fr", None))
+        self.assertEqual(self.choose(None), ("en", None))
+
+    def test_regional_request_falls_back_to_the_language(self):
+        self.assertEqual(self.choose("fr_CA"), ("fr", None))
+        self.assertEqual(self.choose("fr-CA"), ("fr", None))
+
+    def test_unavailable_requests(self):
+        lang, warning = self.choose("de")
+        self.assertEqual(lang, "en")
+        self.assertIn("no de translation", warning)
+        lang, warning = self.choose(None, PYTHON_MANAGER_LANG="de")
+        self.assertIn("no de translation", warning)
+        self.assertEqual(self.choose(None, LANG="de_DE.UTF-8"), ("en", None))   # silent
+
+    def test_system_language(self):
+        self.assertEqual(mp.system_lang({"LANGUAGE": "fr:en", "LANG": "de_DE"}), "fr")
+        self.assertEqual(mp.system_lang({"LC_ALL": "C.UTF-8"}), "en")
+        self.assertEqual(mp.system_lang({"LANG": "pt_BR.UTF-8@euro"}), "pt_BR")
+        self.assertEqual(mp.system_lang({}, windows_ui_lang=lambda: "fr_FR"), "fr_FR")
+
+    def test_invalid_code_is_a_usage_error(self):
+        for bad in ("", "f", "french!", "../fr", "fr_CA_extra_long"):
+            with self.subTest(bad=bad), self.assertRaises(mp.UsageError):
+                self.choose(bad)
+
+    def test_catalog_translates_messages_but_not_names(self):
+        self.assertEqual(mp.available_langs(self.locale), ["en", "fr"])
+        mp.set_language("fr", self.locale)
+        self.assertEqual(mp.format_status([]), "Aucune version de Python installée.\n")
+        line = mp.LineStatus("3.12")
+        line.default = "3.12.14"
+        self.assertIn("par défaut", mp.format_status([line]))
+        self.assertEqual(mp.format_status([], "manage-python 0.3.0").splitlines()[0],
+                         "manage-python 0.3.0")
+        mp.set_language("en")
+        self.assertEqual(mp.format_status([]), "No Python versions installed.\n")
+
+    def test_main_lang_option(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(mp.main(["--lang", "de", "--version"]), 0)
+            self.assertEqual(mp.main(["--lang", "x!", "--version"]), 2)
+        self.assertIn("no de translation is available; using English", err.getvalue())
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err, \
+             mock.patch.dict(os.environ, {"PYTHON_MANAGER_LANG": "de"}):
+            mp.main(["--version"])
+        self.assertIn("no de translation", err.getvalue())
+
+    def test_only_english_ships_for_now(self):
+        self.assertEqual(mp.available_langs(), ["en"])
 
 
 if __name__ == "__main__":

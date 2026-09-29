@@ -7,6 +7,23 @@ N` file and the git tags. Dates are ISO 8601.
 
 ## [Unreleased]
 
+Verified end to end on Linux x86-64. Not yet verified: the Windows registry write, the `.cmd` and `.ps1` aliases, `install.ps1`, macOS, and Python 3.8 at run time. Supersedes 1.0.0, whose `install.sh` and `install.ps1` still ran the 0.2.0 installer, `install-python.py`.
+
+### Added
+
+- Sandbox mode (`PYTHON_MANAGER_SANDBOX`) for tests, smoke runs and end-to-end runs: changing commands refuse to run unless HOME and the XDG variables (LOCALAPPDATA and APPDATA for Windows) are set and lie outside the account's real home, and every file write refuses a path inside the real home. The test suite turns it on and moves HOME and XDG to a scratch directory before anything runs.
+- `--lang` and `PYTHON_MANAGER_LANG`, chosen in the proposal's order: the option, the variable, the system locale, then English. English is the only language for now; a requested language without a catalog falls back to English with a warning.
+- On Windows, `--install` prepends `%LOCALAPPDATA%\Programs` to the user PATH in `HKCU\Environment`, keeping the value's registry type, only when it is not already there, and broadcasts `WM_SETTINGCHANGE`.
+- `e2e_manage_python.py`, the scripted end-to-end pass: two micro versions of one minor line and one of another, installed, switched, renamed, removed and restored offline from the archive, in a scratch home with a download cache.
+
+### Changed
+
+- A first `--install` with no SPEC takes the newest stable minor line in the latest python-build-standalone release. Pre-release (alpha, beta, rc) and free-threaded builds are never selected.
+- `--status` starts with a line naming the manager's alias and the version it runs.
+- `install.sh` and `install.ps1` run `manage-python.py`, with `--install` when given no arguments, and check that the manager's `VERSION` and alias templates are beside it.
+- The proposal is now at 0.7.0; the 0.5.1 and 0.6.0 versions are removed from `en/docs/`.
+- README.md describes 1.0.x as the current release, links the 0.7.0 proposal, says what is verified, and points its links at `en/docs/`.
+
 ## [1.0.0] - 2026-09-29
 
 ### Added

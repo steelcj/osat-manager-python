@@ -1,6 +1,6 @@
 ---
 dc:title: "Proposal: osat-manager-python Layout, Lifecycle and Aliases"
-dcterms:version: "0.6.0"
+dcterms:version: "0.7.0"
 dc:creator: "Christopher Steel"
 dc:contributor: "Claude Opus 5.5 (Anthropic)"
 dc:description: "Proposed layout, commands, aliases, status output, translations and testing for osat-manager-python, the successor to osat-fluent-python-tool, with advantages, disadvantages and notes."
@@ -20,6 +20,18 @@ sat:path: "en/docs/"
 sat:version_at_creation: "0.4.0"
 sat:migration_status: pre-sat
 sat:changelog:
+  - version: "0.7.0"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: >
+      Brought into line with the reference implementation, released as
+      manage-python 1.0.0 and verified end to end on Linux x86-64. Records
+      the 49 differences reported during implementation and the decisions
+      taken on them, among them the SELF pointer keys, pointer validation
+      rules, the .ps1 environment restore, six alias templates, the first
+      install default, the exclusion of pre-release and free-threaded
+      builds, the Windows PATH prepend, sandbox mode, language selection
+      details and the refusal to run as root.
   - version: "0.6.0"
     date: "2026-09-29"
     author: "Christopher Steel"
@@ -68,7 +80,7 @@ sat:changelog:
 
 # Proposal: osat-manager-python Layout, Lifecycle and Aliases
 
-Version: 0.6.0
+Version: 0.7.0
 Status: Draft
 Style Guide: style-guide--technical-documentation-for-technologists
 
@@ -102,7 +114,7 @@ We keep what 0.2.0 does well, verified downloads from a single governed source, 
 
 ### Naming and management identifier
 
-The repository osat-fluent-python-tool is renamed osat-manager-python, keeping its history, and its first release under the new name is 0.3.0. GitHub redirects the old repository URL.
+The repository osat-fluent-python-tool is renamed osat-manager-python, keeping its history, and its first release under the new name is 1.0.0. We had planned to number it 0.3.0; the release was cut as 1.0.0, and because published tags are never reused, 1.0.0 stands. GitHub redirects the old repository URL.
 
 Each manager carries two names with different jobs:
 
@@ -127,8 +139,9 @@ Linux and macOS use the same XDG locations, as the collection specification defi
     python3.13
 
 ~/.local/share/python-manager/
-    manage-python/0.3.0/manage-python.py    the manager, plus PROVENANCE
-    manage-python/0.3.0/locale/             its translations
+    manage-python/1.0.0/manage-python.py    the manager, plus VERSION and PROVENANCE
+    manage-python/1.0.0/scripts/            its six alias templates
+    manage-python/1.0.0/locale/             its translations, when present
     3.12.14/python/bin/python3.12           runtime, plus PROVENANCE
     3.12.13/python/bin/python3.12           versions side by side
     3.13.15/python/bin/python3.13
@@ -151,8 +164,9 @@ Windows:
     python3.13.cmd      python3.13.ps1
 
 %LOCALAPPDATA%\python-manager\
-    manage-python\0.3.0\manage-python.py    the manager, plus PROVENANCE
-    manage-python\0.3.0\locale\             its translations
+    manage-python\1.0.0\manage-python.py    the manager, plus VERSION and PROVENANCE
+    manage-python\1.0.0\scripts\            its six alias templates
+    manage-python\1.0.0\locale\             its translations, when present
     3.12.14\python\python.exe               runtime, plus PROVENANCE
     3.12.13\python\python.exe
     3.13.15\python\python.exe
@@ -185,11 +199,13 @@ We considered a `~/.local/bin/osat/` subdirectory for OSAT aliases. Distribution
 
 ### The manager itself
 
-On first run, from a downloaded release or through `install.sh` or `install.ps1`, the manager installs a copy of itself under `python-manager/manage-python/<version>/` and writes a `manage-python` alias. From then on every command runs from any directory, and the downloaded release can be deleted. New manager versions install side by side, like runtimes, which leaves room for the collection's self-update approach.
+On first run, from a downloaded release or through `install.sh` or `install.ps1`, the manager installs a copy of itself under `python-manager/manage-python/<version>/`, holding the script, its `VERSION` file, its alias templates, its translations when present, and a `PROVENANCE` file, and writes a `manage-python` alias. It does this during `--install` whenever `PYTHON_MANAGER_SELF` is unset or its directory is missing. A newer manager running a later install leaves `SELF` unchanged and logs that self-update is not yet available; changing manager versions is left to a future self-update verb, and `--switch` never changes `SELF`. From then on every command runs from any directory, and the downloaded release can be deleted. New manager versions install side by side, like runtimes, which leaves room for the collection's self-update approach.
 
 After installation the `manage-python` alias runs the manager on the default Python runtime, on every platform. This matters most on Windows, where no system Python remains once the bootstrap copy is gone. Because `--remove` refuses to remove the default version, the manager can never remove the Python it runs on.
 
-On Linux and macOS, the first install can use the system `python3`, version 3.8 or later, with the standard library only. On Windows, and on any system without a suitable Python, the bootstrap scripts provide a temporary interpreter for the first install and then delete it.
+The manager reads its version from the `VERSION` file beside the script, so the repository, the release and every installed copy agree without a second place to update.
+
+On Linux and macOS, the first install can use the system `python3`, version 3.8 or later, with the standard library only. On Windows, and on any system without a suitable Python, the bootstrap scripts provide a temporary interpreter for the first install and then delete it. With no arguments they run `manage-python.py --install`, and they check that `VERSION` and the alias templates are present before downloading anything. The bootstrap interpreter is CPython 3.11.13, pinned for x86-64 and ARM64 glibc Linux and for macOS in `install.sh`, and for x86-64 in `install.ps1`; musl and Windows ARM64 have no bootstrap yet.
 
 #### Alternatives considered
 
@@ -218,7 +234,7 @@ osat-manager-python does not write `python3` or `pip`. On Debian-family systems 
 
 #### Change from 0.2.0
 
-0.2.0 deliberately wrote only versioned wrappers such as `python3.12`, to avoid quietly shadowing a system Python. 0.3.0 adds `python` as a deliberate, visible choice rather than a quiet one: it is listed in `--status`, it can be renamed, and the manager never overwrites a `python` it did not write. On distributions that ship a `python` command, such as Debian-family systems with `python-is-python3` installed, the manager's `python` comes first on PATH for the user who installed it, while system tools that call `/usr/bin/python3` by absolute path are unaffected.
+0.2.0 deliberately wrote only versioned wrappers such as `python3.12`, to avoid quietly shadowing a system Python. 1.0.0 adds `python` as a deliberate, visible choice rather than a quiet one: it is listed in `--status`, it can be renamed, and the manager never overwrites a `python` it did not write. On distributions that ship a `python` command, such as Debian-family systems with `python-is-python3` installed, the manager's `python` comes first on PATH for the user who installed it, while system tools that call `/usr/bin/python3` by absolute path are unaffected.
 
 #### Alternatives considered
 
@@ -241,6 +257,22 @@ manage-python --version                      # this manager's version
 
 The first install runs the downloaded script directly, for example `python3 manage-python.py --install`, or through `install.sh` or `install.ps1`.
 
+Actions are mutually exclusive, and running with no action prints usage and exits with status 2. Commands that change anything refuse to run as root or Administrator, as 0.2.0 did, since a manager for user-space runtimes has no reason to hold those rights.
+
+#### Install
+
+With no version, `--install` takes the newest version of the default's minor line; on a first install it takes the newest stable minor line in the latest release. A full version is restored from the archive first, choosing its newest build, and otherwise found by searching the most recent 150 releases. A version that is already installed is switched to without downloading, even if a different build was named. Pre-release builds and free-threaded builds, whose asset names contain `freethreaded`, are never selected, and a pre-release cannot be named.
+
+Before any network access, the manager checks that every alias the install will write is either absent or its own. The one exception is a first install with no version, where the new minor line is only known after the release lookup; its alias is checked then, before any download. Downloads, extraction and removal happen in hidden `.download-*`, `.staging-*` and `.removing-*` directories inside the share directory and are renamed into place, so a failure leaves nothing half-written. When `GITHUB_TOKEN` is set it is sent to `api.github.com` only, and a rate-limit error suggests naming a pinned build, which needs no API call. A failed health check mentions nix-ld, the usual cause on NixOS.
+
+#### Remove
+
+`--remove` renames a runtime aside before deleting it, so a failed removal never leaves a half-deleted runtime. Removing the last installed version of a minor line other than the default's also removes that line's pointer key and alias files, while keeping a renamed alias's name for the next install. Removing the version a minor line's alias runs, while other versions of that line remain, is refused; the refusal explains the two switches that change it (see the note on changing a minor line's version).
+
+#### Alias
+
+`--alias OLD=NEW` takes the alias's current name as OLD. For an alias not yet written, OLD may be its default name, so a clash can be avoided before the first install. Old alias files are removed only if the manager wrote them; anyone else's are left in place with a warning.
+
 `--switch` takes a full version and makes it current. It works the same way in every OSAT manager: `--switch 3.12.13` here, `--switch 0.19.1` for restic. Other installed versions stay installed and can be switched to at any time. In osat-manager-python, switching to 3.12.13 points both `python` and `python3.12` at it and leaves other minor lines as they are.
 
 `--install` installs a version and switches to it, as it does in every manager. A pinned build skips the GitHub Releases API, as pinned restic versions do.
@@ -252,6 +284,8 @@ We considered letting `--switch` accept a minor version to move `python` between
 ### Status output
 
 ```text
+manage-python 1.0.0
+
 3.12
   aliases     python3.12  python
     default     3.12.14
@@ -263,7 +297,7 @@ We considered letting `--switch` accept a minor version to move `python` between
     default     3.13.15
 ```
 
-Each minor line lists its aliases, then the versions behind them. `python` appears under the minor line it currently runs, so a switch visibly moves it. "default" is the version the aliases run, "installed" is on disk and available through `--switch`, and "archived" is removed but restorable offline. A renamed alias appears under its new name.
+Each minor line lists its aliases, then the versions behind them. `python` appears under the minor line it currently runs, so a switch visibly moves it. "default" is the version the aliases run, "installed" is on disk and available through `--switch`, and "archived" is removed but restorable offline. A renamed alias appears under its new name. The first line shows the manager's own alias and version, or `not installed`. `--status` warns when an alias file is missing or the manager's own version is not installed.
 
 #### Alternatives considered
 
@@ -274,16 +308,20 @@ We considered several words for the version an alias runs. "active" collides wit
 The pointer records which version each alias runs, and the name each alias is written under:
 
 ```sh
+# python-manager.env, written by manage-python. Do not edit.
+# Operator settings belong in env, beside this file.
 PYTHON_MANAGER_DEFAULT="3.12.14"
 PYTHON_MANAGER_3_12="3.12.14"
 PYTHON_MANAGER_3_13="3.13.15"
+PYTHON_MANAGER_SELF="1.0.0"
 
 PYTHON_MANAGER_ALIAS_DEFAULT="python"
 PYTHON_MANAGER_ALIAS_3_12="py312"
 PYTHON_MANAGER_ALIAS_3_13="python3.13"
+PYTHON_MANAGER_ALIAS_SELF="manage-python"
 ```
 
-Each alias reads a fixed version key: `python` reads `PYTHON_MANAGER_DEFAULT` and each versioned alias reads the key for its minor line. The alias lines record the names, so `--install` and `--switch` rewrite each alias under the name the user chose, and `--alias` changes only the alias line and the file name. On Windows the pointer lives in `%LOCALAPPDATA%\python-manager\`, beside the versions it names.
+Each alias reads a fixed version key: `python` reads `PYTHON_MANAGER_DEFAULT`, each versioned alias reads the key for its minor line, and the `manage-python` alias reads `PYTHON_MANAGER_SELF` for the manager version together with `PYTHON_MANAGER_DEFAULT` for the runtime it runs on. The alias lines record the names, so `--install` and `--switch` rewrite each alias under the name the user chose, and `--alias` changes only the alias line and the file name. On Windows the pointer lives in `%LOCALAPPDATA%\python-manager\`, beside the versions it names.
 
 #### Alternatives considered
 
@@ -343,13 +381,16 @@ On Linux and macOS each alias is a POSIX `sh` script rendered from a template, w
 _cfg="${XDG_CONFIG_HOME:-$HOME/.config}/python-manager"
 . "$_cfg/python-manager.env"
 [ -f "$_cfg/env" ] && . "$_cfg/env"
-exec "${XDG_DATA_HOME:-$HOME/.local/share}/python-manager/$PYTHON_MANAGER_3_12/python/bin/python3" "$@"
+exec "${XDG_DATA_HOME:-$HOME/.local/share}/python-manager/${PYTHON_MANAGER_3_12:?not set in python-manager.env}/python/bin/python3" "$@"
 ```
+
+The `:?` guard stops with a clear message if the pointer lacks the key, instead of running a broken path.
 
 On Windows each alias is a `.cmd` and `.ps1` pair doing the same:
 
 ```bat
 @echo off
+rem
 rem source
 rem   project: osat-manager-python
 rem   path: scripts/windows/alias.cmd.template
@@ -361,26 +402,47 @@ rem Do not edit generated aliases; regenerated on --install, --switch and --alia
 setlocal
 call "%LOCALAPPDATA%\python-manager\python-manager.env.cmd"
 if exist "%APPDATA%\python-manager\env.cmd" call "%APPDATA%\python-manager\env.cmd"
+if not defined PYTHON_MANAGER_3_12 goto :unset
 "%LOCALAPPDATA%\python-manager\%PYTHON_MANAGER_3_12%\python\python.exe" %*
+exit /b %ERRORLEVEL%
+:unset
+echo PYTHON_MANAGER_3_12 is not set in python-manager.env.cmd 1>&2
+exit /b 1
 ```
 
-`setlocal` keeps the pointer's variables out of the calling shell.
+`setlocal` keeps the pointer's variables out of the calling shell. PowerShell has no equivalent, and `$env:` changes last for the rest of a session, so each `.ps1` alias takes a snapshot of the environment, dot-sources the pointer and then the operator environment, runs the runtime, and in a `finally` block restores changed variables and removes added ones. It stops with an error when its key is unset, and exits with the runtime's exit code after the environment is restored. The pointer's `.ps1` line syntax is unchanged.
+
+The manager's own alias follows the same pattern and runs the installed manager on the default runtime:
+
+```sh
+exec "$_share/${PYTHON_MANAGER_DEFAULT:?not set in python-manager.env}/python/bin/python3" "$_share/manage-python/${PYTHON_MANAGER_SELF:?not set in python-manager.env}/manage-python.py" "$@"
+```
+
+There are six templates: an alias and a manager alias for each of POSIX `sh`, `.cmd` and `.ps1`. The rendered `path:` line records the file's real location, written with `~` or `%LOCALAPPDATA%` and respecting XDG overrides.
 
 #### PATH
 
-Linux distributions add `~/.local/bin` to PATH automatically. macOS does not, so the installer prints the line to add to `~/.zshrc`, as the collection specification describes. On Windows the installer prepends `%LOCALAPPDATA%\Programs` to the user PATH.
+Linux distributions add `~/.local/bin` to PATH automatically. macOS does not, so the installer prints the line to add to `~/.zshrc`, as the collection specification describes. On Windows every `--install` makes sure `%LOCALAPPDATA%\Programs` comes first in the user PATH, doing nothing when it is already present. It writes the `Path` value under `HKCU\Environment`, keeping its registry type, and broadcasts `WM_SETTINGCHANGE` so new terminals see the change:
+
+- A `REG_EXPAND_SZ` value receives `%LOCALAPPDATA%\Programs` unexpanded; a `REG_SZ` value receives the expanded path; a missing value is created as `REG_EXPAND_SZ`; any other type is refused.
+- An existing entry is recognised after expansion, ignoring case, slash direction, trailing backslashes and quotes.
+- Empty entries are dropped when the value is rewritten.
+
+This puts the manager's aliases ahead of the Microsoft Store alias, which also lives in the user PATH. The system PATH is still searched first.
 
 ### Protecting the installed runtimes
 
-After extracting a runtime, the manager writes an `EXTERNALLY-MANAGED` file into that runtime's standard library directory. pip then refuses to install into the runtime itself and shows the manager's message, which points users to `python3.12 -m venv` <a name="apa-pypa-em-citation-2"></a>([Python Packaging Authority, n.d.](#apa-pypa-em-reference)). Venvs are unaffected. Anaconda's protected base installer takes the same approach for the same reason: installing into the base environment is the most common way users break their installation <a name="apa-anaconda-pbe-citation"></a>([Anaconda, n.d.](#apa-anaconda-pbe-reference)).
+After extracting a runtime, the manager writes an `EXTERNALLY-MANAGED` file into that runtime's standard library directory, `python/lib/python3.X/` on Linux and macOS and `python/Lib/` on Windows. pip then refuses to install into the runtime itself and shows the manager's message, which points users to `python3.X -m venv .venv` using the default alias name, even if that alias has since been renamed <a name="apa-pypa-em-citation-2"></a>([Python Packaging Authority, n.d.](#apa-pypa-em-reference)). Venvs are unaffected. Anaconda's protected base installer takes the same approach for the same reason: installing into the base environment is the most common way users break their installation <a name="apa-anaconda-pbe-citation"></a>([Anaconda, n.d.](#apa-anaconda-pbe-reference)).
 
 We considered relying on documentation alone. It does not prevent the most common way installed runtimes get broken, and the marker is a standard mechanism that pip already honours.
 
 ### Archive and provenance
 
-The archive holds each verified release tarball. It can be checked against its recorded SHA-256 at any time, and restoring it means verify, extract and health-check. A runtime is archived only after its `python` starts and reports the expected version.
+The archive holds each verified release tarball in `archive/<version>+<build>/`, beside a `PROVENANCE` file recording its checksum. Restoring re-verifies the tarball against that checksum and refuses on a mismatch, then extracts and health-checks it. A runtime is archived only after its `python` starts and reports the expected version.
 
 Extraction uses the `data` filter of `tarfile` where the running Python supports it. This rejects unsafe paths in an archive and removes the deprecation warning 0.2.0 prints.
+
+Everything the manager writes, runtimes, archive entries and its own copies, is owner-only. Files a runtime writes later for itself, such as `__pycache__` directories, follow the user's umask, which is harmless inside a runtime directory that is itself owner-only.
 
 We considered archiving the extracted runtime instead of the tarball. An extracted tree is several times larger and cannot be checked against the published checksum, which only covers the tarball.
 
@@ -388,9 +450,15 @@ We considered archiving the extracted runtime instead of the tarball. An extract
 
 The manager's interactive content is translated with gettext, which is part of the Python standard library, so translation adds no dependency. Its `.po` format is the one translators and their tools already use, and it handles plural forms.
 
-In the repository, a template `locale/manage-python.pot` is extracted from the source, and each language has `locale/<lang>/LC_MESSAGES/manage-python.po`, for example `fr`. At release time these are compiled to `.mo` files, which ship with the manager and install at `manage-python/<version>/locale/<lang>/LC_MESSAGES/manage-python.mo`. Translations travel with the manager version they belong to, so a manager version is never paired with another version's messages, and users need no translation tools.
+English is built in as the source language. When the first translation is added, a template `locale/manage-python.pot` is extracted from the source, and each language has `locale/<lang>/LC_MESSAGES/manage-python.po`, for example `fr`. At release time these are compiled to `.mo` files, which ship with the manager and install at `manage-python/<version>/locale/<lang>/LC_MESSAGES/manage-python.mo`. Translations travel with the manager version they belong to, so a manager version is never paired with another version's messages, and users need no translation tools.
 
 The language is chosen in this order: the `--lang` option, then `PYTHON_MANAGER_LANG` in the operator environment, then the system locale, then English.
+
+- An invalid language code given to `--lang` is a usage error.
+- A language requested through `--lang` or `PYTHON_MANAGER_LANG` that has no catalog falls back to English with a warning; an unavailable system locale falls back to English silently.
+- A regional code falls back to its language, so `fr_CA` uses `fr`.
+- `PYTHON_MANAGER_LANG` is read from the process environment, so on Linux and macOS the operator `env` file must `export` it.
+- On Windows the system language is the user's display language.
 
 Messages, prompts and status labels such as "default", "installed" and "archived" are translated. Command names, options, pointer keys and file names never are, and any future machine-readable status output stays untranslated so scripts can parse it. Messages shared by every manager, such as switch and remove confirmations, can later move to the collection's shared module with a catalog of their own.
 
@@ -404,7 +472,7 @@ Several components meet at boundaries that other code relies on. Each boundary i
 
 ### Pointer file
 
-The manager is the only writer of the pointer file; alias wrappers are its readers. It is written to a temporary file in the same directory and renamed into place, so a reader never sees a partial file. It holds only `PYTHON_MANAGER_*` keys, one per line, in the syntax of the shell that reads it:
+The manager is the only writer of the pointer file; alias wrappers are its readers. It is written to a temporary file in the same directory and renamed into place, so a reader never sees a partial file. It holds comment lines naming the file and the operator environment, and `PYTHON_MANAGER_*` keys, one per line, in the syntax of the shell that reads it:
 
 | Platform | File | Line syntax |
 |---|---|---|
@@ -412,11 +480,18 @@ The manager is the only writer of the pointer file; alias wrappers are its reade
 | Windows, Command Prompt | `python-manager.env.cmd` | `set "PYTHON_MANAGER_3_12=3.12.14"` |
 | Windows, PowerShell | `python-manager.env.ps1` | `$env:PYTHON_MANAGER_3_12 = "3.12.14"` |
 
-Version keys hold full versions, `PYTHON_MANAGER_DEFAULT` names the version behind `python`, and `PYTHON_MANAGER_ALIAS_*` keys hold alias names. The three Windows and POSIX files carry the same keys and values.
+Version keys hold full versions, `PYTHON_MANAGER_DEFAULT` names the version behind `python`, `PYTHON_MANAGER_SELF` names the manager version behind `manage-python`, and `PYTHON_MANAGER_ALIAS_*` keys hold alias names, with `PYTHON_MANAGER_ALIAS_SELF` last. The Windows and POSIX files carry the same keys and values. The manager enforces these rules on every write:
+
+- Values contain only letters, digits and `.`, `_`, `+` and `-`, so they are safe inside every alias.
+- `PYTHON_MANAGER_DEFAULT` equals the version key of its own minor line.
+- Alias names are 1 to 64 characters, are unique ignoring case, are not Windows device names such as `NUL` or `CON`, and do not end in `.cmd`, `.ps1`, `.exe` or `.bat`.
+- `manage-python` is reserved for the manager's own alias.
+
+Unknown `PYTHON_MANAGER_*` keys are kept when the file is rewritten, so a later manager version can add keys without an earlier one discarding them. An alias name record is kept even when its minor line has no installed version, so a rename survives until the next install.
 
 ### Alias wrappers
 
-Each alias reads the pointer first and the operator environment second, the order restic-tool's wrappers use, so an operator can override a value for their own sessions without editing a manager-owned file. The alias passes every argument through unchanged and returns the runtime's exit status: on Linux and macOS through `exec`, on Windows as the exit code of its last command. The header block's `by:` line is how the manager recognises its own aliases before overwriting one.
+Each alias reads the pointer first and the operator environment second, the order restic-tool's wrappers use, so an operator can override a value for their own sessions without editing a manager-owned file. The alias passes every argument through unchanged and returns the runtime's exit status: on Linux and macOS through `exec`, and on Windows by passing on the runtime's exit code explicitly. The header block's `by:` line is how the manager recognises its own aliases before overwriting one. It counts only inside the header's `generated` section, and symbolic links, binary files and unreadable files always count as someone else's. On Windows, a foreign `.cmd` or `.ps1` blocks writing both files of the pair.
 
 ### PROVENANCE
 
@@ -424,17 +499,17 @@ Every installed runtime and every installed manager version carries a `PROVENANC
 
 | Key | Meaning |
 |---|---|
-| `manager` | The manager and its version, for example `manage-python 0.3.0` |
+| `manager` | The manager and its version, for example `manage-python 1.0.0` |
 | `asset` | The release file name |
 | `sha256` | Checksum of the release file, verified before extraction |
-| `source` | Download URL, or `local archive (<path>)` for an offline restore |
+| `source` | Download URL, `local archive (<path>)` for an offline restore, or `local copy (<path>)` for a manager installed from a local file |
 | `installed` | UTC timestamp in ISO 8601 form |
 | `version` | Full CPython version, for example `3.12.14` |
 | `build` | python-build-standalone release tag, for example `20260924` |
 | `triple` | Platform triple, for example `x86_64-unknown-linux-gnu` |
 
 ```text
-manager: manage-python 0.3.0
+manager: manage-python 1.0.0
 asset: cpython-3.12.14+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
 sha256: <64 hexadecimal characters>
 source: https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
@@ -444,7 +519,7 @@ build: 20260924
 triple: x86_64-unknown-linux-gnu
 ```
 
-A manager version's `PROVENANCE` uses the first five keys. `--status` reads these files, and other managers may read them to report which runtime they depend on. Readers ignore keys they do not know, so later versions can add keys without breaking earlier readers.
+A manager version's `PROVENANCE` uses the first five keys, with `asset: manage-python.py` and the script's checksum. A runtime's `manager` key records the manager version that installed it. `--status` reads these files, and other managers may read them to report which runtime they depend on. Readers ignore keys they do not know, so later versions can add keys without breaking earlier readers.
 
 ### Runtimes used by other managers
 
@@ -452,11 +527,11 @@ Another manager, such as sat-manager, reaches a Python runtime through a version
 
 ### Operator output and logging
 
-Output the user asked for, such as `--status` and `--version`, goes to standard output. Progress, warnings and errors go to standard error, prefixed `[manage-python]`, so output can be piped or captured without mixing the two. The manager exits with 0 on success, 1 when an action fails and 2 for incorrect usage. Each lifecycle action, install, switch, remove, alias and restore, appends one line to `manage-python.log` in the state directory, `~/.local/state/python-manager/` or `%LOCALAPPDATA%\python-manager\logs\`, recording the time, the action, the version and the result.
+Output the user asked for, such as `--status` and `--version`, goes to standard output. Progress, warnings and errors go to standard error, prefixed `[manage-python]`, so output can be piped or captured without mixing the two. The manager exits with 0 on success, 1 when an action fails and 2 for incorrect usage. Each lifecycle action, install, switch, remove, alias and restore, appends one line to `manage-python.log` in the state directory, `~/.local/state/python-manager/` or `%LOCALAPPDATA%\python-manager\logs\`, in the form `<UTC time> <action> <version> ok` or `<UTC time> <action> <version> failed: <message>`. For `--alias` the logged value is the new name. Usage errors are not logged.
 
 ## Implementation
 
-The implementation is `manage-python.py` in this repository, together with its alias templates in `scripts/nix/` and `scripts/windows/`, its message catalogs in `locale/`, and its tests. It is built to the contracts above and released as 0.3.0.
+The implementation is `manage-python.py` in this repository, together with its six alias templates in `scripts/nix/` and `scripts/windows/`, its tests, and the bootstrap scripts `install.sh` and `install.ps1`. It is built to the contracts above and was released as 1.0.0. At release, 194 unit tests passed, and an end-to-end run on Linux x86-64 with CPython 3.12.14, 3.12.13 and 3.13.15 covered install, switch, rename, the pip refusal, venv creation, removal and an offline restore through the installed `manage-python` alias.
 
 ## Advantages and disadvantages
 
@@ -472,18 +547,21 @@ The implementation is `manage-python.py` in this repository, together with its a
 | Tarball archive with build tag | Exact provenance and offline restore | Archive grows with each build installed |
 | `manage-<name>` commands | Reads as what you run; one pattern across the collection | Each manager has two names to learn, its command and its identifier |
 | Manager installs itself | Works from any directory; the download can be deleted; manager versions sit side by side | The manager depends on the default runtime it manages |
+| Sandbox mode for tests | Tests cannot reach the real home directory or registry | One more environment variable to know about when developing |
 | gettext translations | Standard library only; familiar to translators; versioned with the manager | A compile step at release time |
 
 ## Testing before release
 
 The manager's logic is tested with the standard library's `unittest`: pointer and alias record parsing, platform triple selection, version resolution and status output. A scripted end-to-end run installs, switches, renames, removes and restores real python-build-standalone runtimes, and is run on each platform listed below. Neither adds a dependency.
 
+Tests and end-to-end runs never touch the real home directory. Setting `PYTHON_MANAGER_SANDBOX` puts the manager in sandbox mode: commands that change anything refuse to run unless `HOME` and every XDG variable, and `LOCALAPPDATA` and `APPDATA` when simulating Windows, are set to locations outside the real home, which is read from the system rather than from `HOME`. Every function that writes also refuses a path inside the real home, including one reached through a symbolic link, and sandbox mode never touches the Windows registry. The test suite and the end-to-end runner both turn sandbox mode on before the manager loads.
+
 Each release is tested on every platform it claims to support. A platform without hardware available is listed as untested in the release notes rather than claimed.
 
 | Platform | Machine | Status |
 | --- | --- | --- |
-| Linux x86-64 | Linux Mint 22.3 workstation | Tested every release |
-| Windows 11 x86-64 | Windows 11 virtual machine | Tested every release |
+| Linux x86-64 | Linux Mint 22.3 workstation | Tested every release; end-to-end verified for 1.0.0 |
+| Windows 11 x86-64 | Windows 11 virtual machine | Tested every release; for 1.0.0 the registry write, the `.cmd` and `.ps1` aliases and `install.ps1` are not yet verified |
 | macOS Apple Silicon | Apple Silicon Mac | Needs hardware |
 | macOS Intel | Intel Mac | Optional, listed as untested without hardware |
 | NixOS x86-64 | NixOS machine or virtual machine | Listed as untested until run |
@@ -508,6 +586,10 @@ On macOS, whether Gatekeeper allows the runtimes to run without prompting.
 ## Notes
 
 These notes cover situations some users will meet. They are documentation, not design constraints.
+
+### Changing a minor line's version without moving python
+
+`--switch` always points both `python` and the minor line's alias at the version it names. To change which 3.13 version `python3.13` runs while `python` stays on 3.12, switch to the 3.13 version and then switch back to the 3.12 version. The manager suggests this sequence when it refuses a removal that would need it.
 
 ### Coexisting with uv
 
@@ -558,6 +640,7 @@ Adopting this proposal implies the following changes to the OSAT user-space inst
 - Record `-manager` as the target management identifier, and `manage-<name>` as the command pattern.
 - Define that each manager installs itself under `<identifier>/manage-<name>/<version>/` and is reached through its own alias.
 - Define gettext as the translation mechanism, with catalogs versioned alongside each manager.
+- Define the `SELF` pointer keys, the pointer validation rules, the `.ps1` environment restore, sandbox mode and the refusal to run as root as collection-wide rules; restic-tool's `.ps1` wrappers have the same environment leak.
 - Define aliases, `--alias`, the alias record in the pointer file, and the rule that a manager never silently overwrites a file it did not write.
 - Define `--switch` as taking a full version in every manager.
 - Use "default", "installed" and "archived" in status output, replacing "active".
@@ -620,6 +703,7 @@ This document, *Proposal: osat-manager-python Layout, Lifecycle and Aliases*, by
 
 | Version | Status | Notes |
 |---------|--------|-------|
+| 0.7.0 | Draft | Brought into line with the reference implementation, released as manage-python 1.0.0 and verified end to end on Linux x86-64: SELF pointer keys, pointer comments and validation rules, preserved unknown keys, the `:?` guard, `.cmd` exit handling, the `.ps1` environment restore, six alias templates, manager directory contents and self-install behaviour, install, remove and alias details, exclusion of pre-release and free-threaded builds, the Windows PATH prepend, sandbox mode, language selection details, log format, the status header line, the refusal to run as root, and owner-only permissions refined |
 | 0.6.0 | Draft | Restructured to the technical documentation guide: the old implementation described, proposed changes presented as the new implementation, alternatives considered recorded for each decision, and a Contracts between components section defining the pointer file, alias wrappers, PROVENANCE, runtimes used by other managers, and operator output and logging; alias wrappers aligned with restic-tool's template header and sourcing order; Implementation section added |
 | 0.5.1 | Draft | Conformance pass against the repository's markdown defaults and the versioned-documents style guide: Dublin Core frontmatter, Style Guide line naming the technical guide, Abstract, Sources and Acknowledgements, Resources, Citation Anchor Pairs in the house format, canonical closing sequence, code documentation license template; content unchanged |
 | 0.5.0 | Draft | Decisions for the reference implementation: repository renamed to osat-manager-python with 0.3.0 as its first release; management identifier and command separated, with `manage-python` and the `manage-<name>` pattern; the manager installs itself, is reached through its own alias and runs on the default runtime; Python 3.8 floor for first installs on Linux and macOS; gettext translations and their locations; `unittest` and end-to-end testing; change from 0.2.0's versioned-only wrappers explained |

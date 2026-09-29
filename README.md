@@ -6,9 +6,11 @@ A governed OSAT Fluent manager that installs self-contained CPython runtimes int
 
 ## Status
 
-**0.2.0, current release.** An installer, run as `install-python.py`, that installs one CPython runtime per minor version and writes a versioned wrapper such as `python3.12`. Documented in [docs/en/README.md](docs/en/README.md). Tested end to end on Linux and on Windows 11.
+**1.0.x, current release.** The first release as a full manager, run as `manage-python`. It keeps versions side by side and switches between them, adds a generic `python` alias alongside the versioned ones, lets any alias be renamed, protects installed runtimes from accidental package installs, keeps a verified archive for offline restores, and installs itself so it works from any directory. The design is set out in the [proposal](en/docs/proposal--osat-manager-python-layout-and-lifecycle-v0-7-0.md).
 
-**0.3.0, in development.** The first release as a full manager, run as `manage-python`. It keeps versions side by side and switches between them, adds a generic `python` alias alongside the versioned ones, lets any alias be renamed, protects installed runtimes from accidental package installs, keeps a verified archive for offline restores, and installs itself so it works from any directory. The design is set out in the [proposal](docs/en/proposal--osat-manager-python-layout-and-lifecycle-v0-5-0.md).
+Verified end to end on Linux x86-64; not yet verified: the Windows registry write, the `.cmd` and `.ps1` aliases, `install.ps1`, macOS, and Python 3.8 at run time.
+
+**0.2.0, previous release.** An installer, run as `install-python.py`, that installs one CPython runtime per minor version and writes a versioned wrapper such as `python3.12`. Documented in [en/docs/README.md](en/docs/README.md). Tested end to end on Linux and on Windows 11.
 
 ## About the rename
 
@@ -24,4 +26,4 @@ GitHub names its generated source archives after the repository, so the source z
 
 ## Languages
 
-- [English](docs/en/README.md)
+- [English](en/docs/README.md)

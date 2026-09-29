@@ -1,14 +1,16 @@
 #!/bin/sh
-# install.sh -- no-Python bootstrap for python-tool on Linux and macOS.
+# install.sh -- no-Python bootstrap for osat-manager-python on Linux and macOS.
 #
-# install-python.py is itself a Python script, so it can't be the first
+# manage-python.py is itself a Python script, so it can't be the first
 # thing that runs on a machine with no Python at all. This script exists
 # to solve exactly that, and only that. It does not reimplement the real
 # install: it fetches a small, pinned, checksum-verified, disposable
-# CPython build, uses it once to run install-python.py, then deletes it.
+# CPython build, uses it once to run manage-python.py, then deletes it.
 # The permanent, governed, checksum-verified install still comes entirely
-# from install-python.py's own release lookup, exactly as if you already
-# had a working `python3` on the machine.
+# from manage-python.py's own release lookup, exactly as if you already
+# had a working `python3` on the machine. manage-python.py also installs
+# itself, so afterwards `manage-python` runs from any directory on the
+# runtime it installed, and this bootstrap is no longer needed.
 #
 # Requires only `curl` and `tar`. Both ship unconditionally as base OS
 # utilities on Linux and macOS; neither is part of the Xcode Command Line
@@ -16,14 +18,14 @@
 # developer tooling installed at all.
 #
 # Usage:
-#   ./install.sh [args passed through to install-python.py]
-#   ./install.sh --track 3.11
+#   ./install.sh                  same as ./install.sh --install
+#   ./install.sh --install 3.13   any manage-python.py arguments, passed through
 
 set -eu
 
 # Pinned bootstrap release. This intentionally does NOT look up "latest"
 # from the GitHub API: the bootstrap Python is disposable and only needs
-# to be capable of running install-python.py, which does its own, current,
+# to be capable of running manage-python.py, which does its own, current,
 # checksum-verified release lookup for the real, permanent install. Pinning
 # avoids a GitHub API dependency (and its rate limits) in the one script
 # that most needs to be simple and hard to break.
@@ -39,9 +41,9 @@ log() {
     echo "[install.sh] $1"
 }
 
-# Refuse root, same as install-python.py: this is strictly a user-space tool.
+# Refuse root, same as manage-python.py: this is strictly a user-space tool.
 if [ "$(id -u)" = "0" ]; then
-    fail "refusing to run as root. python-tool installs entirely in user-space under \$HOME."
+    fail "refusing to run as root. osat-manager-python installs entirely in user-space under \$HOME."
 fi
 
 command -v curl >/dev/null 2>&1 || fail "curl is required but was not found."
@@ -55,11 +57,17 @@ if [ "$(uname -s)" = "Linux" ]; then
     command -v gzip >/dev/null 2>&1 || fail "gzip is required but was not found (this GNU tar build shells out to it for .tar.gz extraction)."
 fi
 
-# Resolve the directory this script lives in, so install-python.py is found
-# next to it regardless of the caller's current working directory.
+# Resolve the directory this script lives in, so manage-python.py and the
+# files it installs with itself (VERSION, the alias templates) are found next
+# to it regardless of the caller's current working directory.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-INSTALL_PY="${SCRIPT_DIR}/install-python.py"
-[ -f "$INSTALL_PY" ] || fail "install-python.py not found next to this script at ${INSTALL_PY}. Check out the full repository, not just this file."
+MANAGE_PY="${SCRIPT_DIR}/manage-python.py"
+for required in manage-python.py VERSION scripts/nix/alias.template scripts/nix/manager-alias.template; do
+    [ -f "${SCRIPT_DIR}/${required}" ] || fail "${required} not found next to this script in ${SCRIPT_DIR}. Download the full release, not just this file."
+done
+
+# With no arguments, install: the latest stable CPython and the manager itself.
+[ "$#" -gt 0 ] || set -- --install
 
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -113,9 +121,9 @@ tar -xzf "${ARCHIVE}" -C "${TMP_DIR}" || fail "extraction failed"
 BOOTSTRAP_PYTHON="${TMP_DIR}/python/bin/python3.11"
 [ -x "${BOOTSTRAP_PYTHON}" ] || fail "expected interpreter not found after extraction: ${BOOTSTRAP_PYTHON}"
 
-log "bootstrap Python ready. Handing off to install-python.py for the real, verified install..."
-"${BOOTSTRAP_PYTHON}" "${INSTALL_PY}" "$@"
-STATUS=$?
+log "bootstrap Python ready. Handing off to manage-python.py for the real, verified install..."
+STATUS=0
+"${BOOTSTRAP_PYTHON}" "${MANAGE_PY}" "$@" || STATUS=$?
 
 log "done (bootstrap Python will now be cleaned up; it was never the permanent install)."
 exit "${STATUS}"
