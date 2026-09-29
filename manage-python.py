@@ -10,13 +10,18 @@ pointer file records which version each alias runs and the name each alias
 is written under. It is the reference implementation of the proposal
 "osat-manager-python Layout, Lifecycle and Aliases" (en/docs/).
 
-This build implements the parts that need no downloads: the pointer file and
-alias record, PROVENANCE, platform triple selection, status output and alias
-rendering with its ownership check. Install, switch, remove and alias
-renaming follow.
+Every download is verified against the release's SHA256SUMS before it is
+extracted, every runtime is health-checked before it is used, and every
+verified release tarball is kept in a local archive, so reinstalling a
+version works offline (archive-first resolution).
 
 Usage:
+    manage-python --install [SPEC]     Install and switch to a runtime (default: latest of the default minor line)
+                                       SPEC is 3.13, 3.12.14 or 3.12.14+20260924 (no API call)
+    manage-python --switch VERSION     Make an installed version the one python and its minor alias run
     manage-python --status             Show aliases, default, installed and archived versions
+    manage-python --remove VERSION     Remove an installed version no alias needs (archive is kept)
+    manage-python --alias OLD=NEW      Rename an alias
     manage-python --version            Show this manager's version
 
 What this manager owns (the python-manager management identifier):
@@ -25,50 +30,64 @@ What this manager owns (the python-manager management identifier):
     ~/.local/share/python-manager/manage-python/      The manager itself
     ~/.config/python-manager/python-manager.env       Pointer, sourced by the aliases
     ~/.local/state/python-manager/                    State and logs
-    ~/.local/bin/python, python3.12, ...              Generated aliases
+    ~/.local/bin/python, python3.12, manage-python    Generated aliases
 
 What this manager does not touch:
     ~/.config/python-manager/env                      Operator environment
     Any file in ~/.local/bin it did not write
 
-Requires: Python 3.8+ (standard library only).
+Requires: Python 3.8+ (standard library only), and network access when a
+requested runtime is not already in the local archive.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import gettext
+import hashlib
+import json
 import os
 import platform
 import re
+import shutil
 import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MANAGER_VERSION = "0.3.0"
-MANAGER_ID      = "python-manager"     # management identifier, owns files
-COMMAND         = "manage-python"      # the command users run
-SCRIPT_NAME     = "manage-python.py"   # recorded on the by: line of aliases
-PROJECT         = "osat-manager-python"
+MANAGER_ID  = "python-manager"     # management identifier, owns files
+COMMAND     = "manage-python"      # the command users run
+SCRIPT_NAME = "manage-python.py"   # recorded on the by: line of aliases
+PROJECT     = "osat-manager-python"
 
 _HERE         = Path(__file__).resolve().parent
 TEMPLATES_DIR = _HERE / "scripts"
+
+GITHUB_REPO   = "astral-sh/python-build-standalone"
+API_BASE      = f"https://api.github.com/repos/{GITHUB_REPO}"
+DOWNLOAD_BASE = f"https://github.com/{GITHUB_REPO}/releases/download"
+FLAVOR        = "install_only_stripped"
+DEFAULT_TRACK = "3.12"             # minor line for a first --install with no SPEC
+RELEASE_PAGES = 5                  # pages of 30 releases searched for a full version
 
 DIR_MODE  = 0o700
 FILE_MODE = 0o600
 EXEC_MODE = 0o700
 
-KEY_PREFIX    = "PYTHON_MANAGER_"
-DEFAULT       = "DEFAULT"              # alias slot for the generic python
-DEFAULT_NAME  = "python"
-RESERVED_NAMES = {COMMAND}
+KEY_PREFIX   = "PYTHON_MANAGER_"
+DEFAULT      = "DEFAULT"           # alias slot for the generic python
+SELF         = "SELF"              # alias slot for the manager itself
+DEFAULT_NAME = "python"
 
 VERSION_RE    = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 MINOR_RE      = re.compile(r"^(\d+)\.(\d+)$")
@@ -91,6 +110,10 @@ class ManagerError(RuntimeError):
     """Raised for any condition that should stop the manager with a clear message."""
 
 
+class UsageError(ManagerError):
+    """A command given incorrectly; the manager exits with 2."""
+
+
 # ── Small helpers ─────────────────────────────────────────────────────────────
 
 def log(message: str) -> None:
@@ -99,6 +122,15 @@ def log(message: str) -> None:
 
 def is_windows() -> bool:
     return platform.system() == "Windows"
+
+
+def manager_version(directory: Path = _HERE) -> str:
+    """This manager's version, from the VERSION file beside the script. The
+    installed copy carries its own VERSION, so the file is the single source."""
+    try:
+        return (directory / "VERSION").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return "unknown"
 
 
 def version_key(version: str) -> Tuple[int, int, int]:
@@ -119,12 +151,24 @@ def minor_sort_key(minor: str) -> Tuple[int, int]:
 
 
 def slot_key(slot: str) -> str:
-    """Pointer key suffix for an alias slot: DEFAULT or a minor line, 3.12 -> 3_12."""
-    return DEFAULT if slot == DEFAULT else slot.replace(".", "_")
+    """Pointer key suffix for an alias slot: DEFAULT, SELF or a minor line, 3.12 -> 3_12."""
+    return slot if slot in (DEFAULT, SELF) else slot.replace(".", "_")
 
 
 def default_alias_name(slot: str) -> str:
-    return DEFAULT_NAME if slot == DEFAULT else f"python{slot}"
+    if slot == DEFAULT:
+        return DEFAULT_NAME
+    if slot == SELF:
+        return COMMAND
+    return f"python{slot}"
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ── Platform paths ────────────────────────────────────────────────────────────
@@ -141,6 +185,7 @@ class Paths:
                  home: Optional[Path] = None) -> None:
         self.windows = is_windows() if windows is None else windows
         env = os.environ if environ is None else environ
+        self.environ = env
         self.home = Path.home() if home is None else home
 
         if self.windows:
@@ -190,6 +235,20 @@ class Paths:
 
     def runtime_dir(self, version: str) -> Path:
         return self.share_dir / version
+
+    def archive_entry(self, version: str, build: str) -> Path:
+        return self.archive_dir / f"{version}+{build}"
+
+    def interpreter(self, root: Path) -> Path:
+        """The interpreter inside a runtime directory (or a staging copy of one)."""
+        if self.windows:
+            return root / "python" / "python.exe"
+        return root / "python" / "bin" / "python3"
+
+    def stdlib_dir(self, root: Path, version: str) -> Path:
+        if self.windows:
+            return root / "python" / "Lib"
+        return root / "python" / "lib" / f"python{minor_of(version)}"
 
     def display(self, path: Path) -> str:
         """A path as a person reads it: ~ on POSIX, %LOCALAPPDATA% on Windows."""
@@ -244,6 +303,29 @@ def atomic_write_text(path: Path, text: str, *, newline: str = "\n",
         raise
 
 
+def make_owner_only(root: Path) -> None:
+    """Owner-only permissions throughout a tree, keeping execute bits."""
+    for path in [root, *root.rglob("*")]:
+        if path.is_symlink():
+            continue
+        try:
+            if path.is_dir():
+                path.chmod(DIR_MODE)
+            else:
+                executable = stat.S_IMODE(path.stat().st_mode) & 0o111
+                path.chmod(EXEC_MODE if executable else FILE_MODE)
+        except OSError:
+            continue
+
+
+def remove_tree(path: Path) -> None:
+    """Remove a manager-owned tree, clearing read-only flags Windows sets."""
+    def retry(function, target, _info):
+        os.chmod(target, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        function(target)
+    shutil.rmtree(str(path), onerror=retry)
+
+
 # ── Pointer file and alias record ─────────────────────────────────────────────
 
 # One line of each pointer syntax. Values are restricted to SAFE_VALUE_RE on
@@ -263,7 +345,7 @@ _POINTER_FORMAT = {
     "cmd":   ('rem {line}', 'set "{key}={value}"'),
     "ps1":   ('# {line}', '$env:{key} = "{value}"'),
 }
-_POINTER_NEWLINE = {"posix": "\n", "cmd": "\r\n", "ps1": "\r\n"}
+_NEWLINE = {"posix": "\n", "cmd": "\r\n", "ps1": "\r\n"}
 
 
 class PointerRecord:
@@ -271,20 +353,23 @@ class PointerRecord:
 
     `default` is the full version behind the generic alias, `lines` maps each
     minor line ("3.12") to the full version its versioned alias runs, and
-    `aliases` maps an alias slot (DEFAULT or a minor line) to a name the user
-    chose. Slots without a recorded name use the default names, python and
-    python3.12. `extra` keeps PYTHON_MANAGER_* keys this version does not
-    know, so a rewrite never drops what a newer manager recorded.
+    `self_version` is the manager version the manager's own alias runs.
+    `aliases` maps an alias slot (DEFAULT, SELF or a minor line) to a name the
+    user chose; slots without one use python, manage-python and python3.12.
+    `extra` keeps PYTHON_MANAGER_* keys this version does not know, so a
+    rewrite never drops what a newer manager recorded.
     """
 
     def __init__(self, default: Optional[str] = None,
                  lines: Optional[Dict[str, str]] = None,
                  aliases: Optional[Dict[str, str]] = None,
-                 extra: Optional[Dict[str, str]] = None) -> None:
+                 extra: Optional[Dict[str, str]] = None,
+                 self_version: Optional[str] = None) -> None:
         self.default = default
         self.lines = dict(lines or {})
         self.aliases = dict(aliases or {})
         self.extra = dict(extra or {})
+        self.self_version = self_version
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PointerRecord):
@@ -294,16 +379,28 @@ class PointerRecord:
     def __repr__(self) -> str:
         return f"PointerRecord({self.to_items()!r})"
 
+    def copy(self) -> "PointerRecord":
+        return copy.deepcopy(self)
+
     def alias_name(self, slot: str) -> str:
         return self.aliases.get(slot) or default_alias_name(slot)
 
     def active_slots(self) -> List[str]:
-        """Slots that currently have an alias: DEFAULT if set, then each minor line."""
+        """Slots that currently have an alias: DEFAULT, each minor line, SELF."""
         slots = [DEFAULT] if self.default else []
-        return slots + sorted(self.lines, key=minor_sort_key)
+        slots += sorted(self.lines, key=minor_sort_key)
+        return slots + ([SELF] if self.self_version else [])
+
+    def slot_named(self, name: str) -> Optional[str]:
+        """The active slot whose alias is currently called `name`."""
+        for slot in self.active_slots():
+            if self.alias_name(slot) == name:
+                return slot
+        return None
 
     def switch(self, version: str) -> None:
-        """Point the generic alias and the version's minor line at `version`."""
+        """Point the generic alias and the version's minor line at `version`.
+        The manager's own version is never changed here."""
         version_key(version)
         self.default = version
         self.lines[minor_of(version)] = version
@@ -317,9 +414,11 @@ class PointerRecord:
             items.append((KEY_PREFIX + DEFAULT, self.default))
         for minor in sorted(self.lines, key=minor_sort_key):
             items.append((KEY_PREFIX + slot_key(minor), self.lines[minor]))
+        if self.self_version:
+            items.append((KEY_PREFIX + SELF, self.self_version))
         alias_slots = self.active_slots()
         alias_slots += sorted((s for s in self.aliases if s not in alias_slots), key=_slot_order)
-        for slot in alias_slots:
+        for slot in sorted(alias_slots, key=_slot_order):
             items.append((f"{KEY_PREFIX}ALIAS_{slot_key(slot)}", self.alias_name(slot)))
         items.extend(sorted(self.extra.items()))
         return items
@@ -331,6 +430,8 @@ class PointerRecord:
             suffix = key[len(KEY_PREFIX):]
             if suffix == DEFAULT:
                 record.default = value
+            elif suffix == SELF:
+                record.self_version = value
             elif suffix.startswith("ALIAS_"):
                 record.aliases[_slot_from_suffix(suffix[len("ALIAS_"):], key)] = value
             elif re.fullmatch(r"\d+_\d+", suffix):
@@ -358,10 +459,12 @@ class PointerRecord:
                     "line ({line}); python and python{minor} must agree"
                 ).format(default=self.default, line=line_version or _("unset"),
                          minor=minor_of(self.default)))
+        if self.self_version is not None:
+            version_key(self.self_version)
         seen: Dict[str, str] = {}
-        for slot in set(self.active_slots()) | set(self.aliases):
+        for slot in sorted(set(self.active_slots()) | set(self.aliases), key=_slot_order):
             name = self.alias_name(slot)
-            check_alias_name(name)
+            check_alias_name(name, slot)
             # Windows and macOS filesystems are case-insensitive by default.
             folded = name.casefold()
             if folded in seen and seen[folded] != slot:
@@ -370,21 +473,27 @@ class PointerRecord:
 
 
 def _slot_order(slot: str) -> Tuple[int, int, int]:
-    """DEFAULT first, then minor lines in numeric order."""
-    return (0, 0, 0) if slot == DEFAULT else (1,) + minor_sort_key(slot)
+    """DEFAULT first, then minor lines in numeric order, then SELF."""
+    if slot == DEFAULT:
+        return (0, 0, 0)
+    if slot == SELF:
+        return (2, 0, 0)
+    return (1,) + minor_sort_key(slot)
 
 
 def _slot_from_suffix(suffix: str, key: str) -> str:
-    if suffix == DEFAULT:
-        return DEFAULT
+    if suffix in (DEFAULT, SELF):
+        return suffix
     if re.fullmatch(r"\d+_\d+", suffix):
         return suffix.replace("_", ".")
     raise ManagerError(_("unknown alias key {key}").format(key=key))
 
 
-def check_alias_name(name: str) -> None:
+def check_alias_name(name: str, slot: Optional[str] = None) -> None:
+    """Refuse a name that is not a safe file name on every platform, or that
+    takes manage-python for anything but the manager's own alias."""
     if (not ALIAS_NAME_RE.match(name)
-            or name in RESERVED_NAMES
+            or (slot != SELF and name.casefold() == COMMAND)
             or name.split(".")[0].casefold() in WINDOWS_RESERVED
             or name.casefold().endswith((".cmd", ".ps1", ".exe", ".bat"))):
         raise ManagerError(_(
@@ -453,7 +562,7 @@ def write_pointer(record: PointerRecord, paths: Paths) -> None:
     ensure_dir(paths.pointer_dir, paths.windows)
     for fmt, path in paths.pointer_files.items():
         atomic_write_text(path, render_pointer(record, fmt, paths),
-                          newline=_POINTER_NEWLINE[fmt], windows=paths.windows)
+                          newline=_NEWLINE[fmt], windows=paths.windows)
 
 
 # ── PROVENANCE ────────────────────────────────────────────────────────────────
@@ -484,14 +593,14 @@ def render_provenance(fields: Mapping[str, str], keys: Tuple[str, ...]) -> str:
 def write_provenance(directory: Path, *, asset: str, sha256: str, source: str,
                      version: Optional[str] = None, build: Optional[str] = None,
                      triple: Optional[str] = None, now: Optional[datetime] = None,
-                     windows: bool = False) -> Path:
+                     windows: bool = False, manager: Optional[str] = None) -> Path:
     """Write PROVENANCE into `directory`. A runtime passes version, build and
     triple; a manager version passes none of them and gets the first five keys."""
     runtime_fields = (version, build, triple)
     if any(runtime_fields) and not all(runtime_fields):
         raise ManagerError(_("a runtime's PROVENANCE needs version, build and triple together"))
     fields = {
-        "manager": f"{COMMAND} {MANAGER_VERSION}",
+        "manager": f"{COMMAND} {manager or manager_version()}",
         "asset": asset,
         "sha256": sha256.lower(),
         "source": source,
@@ -661,13 +770,18 @@ def detect_triple() -> str:
 # ── Filesystem inventory ──────────────────────────────────────────────────────
 
 def installed_versions(paths: Paths) -> List[str]:
-    """Runtime directories on disk, newest first. archive/ and manage-python/
-    are excluded because they are not full versions."""
+    """Runtime directories on disk, newest first. archive/, manage-python/
+    and staging directories are excluded because they are not full versions."""
     if not paths.share_dir.is_dir():
         return []
     found = [entry.name for entry in paths.share_dir.iterdir()
              if entry.is_dir() and VERSION_RE.match(entry.name)]
     return sorted(found, key=version_key, reverse=True)
+
+
+def _archive_sort_key(name: str) -> Tuple[Tuple[int, int, int], int]:
+    version, build = ARCHIVE_RE.match(name).groups()  # type: ignore[union-attr]
+    return version_key(version), int(build)
 
 
 def archived_builds(paths: Paths) -> List[str]:
@@ -676,11 +790,7 @@ def archived_builds(paths: Paths) -> List[str]:
         return []
     found = [entry.name for entry in paths.archive_dir.iterdir()
              if entry.is_dir() and ARCHIVE_RE.match(entry.name)]
-
-    def key(name: str) -> Tuple[Tuple[int, int, int], int]:
-        version, build = ARCHIVE_RE.match(name).groups()  # type: ignore[union-attr]
-        return version_key(version), int(build)
-    return sorted(found, key=key, reverse=True)
+    return sorted(found, key=_archive_sort_key, reverse=True)
 
 
 # ── Status ────────────────────────────────────────────────────────────────────
@@ -721,6 +831,9 @@ def collect_status(paths: Paths, record: PointerRecord) -> Tuple[List[LineStatus
                          if minor_of(ARCHIVE_RE.match(b).group(1)) == minor  # type: ignore[union-attr]
                          and ARCHIVE_RE.match(b).group(1) not in installed_set]  # type: ignore[union-attr]
         lines.append(line)
+    if record.self_version and not (paths.manager_dir / record.self_version).is_dir():
+        warnings.append(_("the pointer names manager {version} for {alias}, but it is not installed")
+                        .format(version=record.self_version, alias=record.alias_name(SELF)))
     for slot in record.active_slots():
         name = record.alias_name(slot)
         for alias_path, _fmt in paths.alias_files(name):
@@ -758,12 +871,21 @@ ALIAS_TEMPLATES = {
     "cmd":   ("windows/alias.cmd.template", "rem"),
     "ps1":   ("windows/alias.ps1.template", "#"),
 }
+MANAGER_ALIAS_TEMPLATES = {
+    "posix": ("nix/manager-alias.template", "#"),
+    "cmd":   ("windows/manager-alias.cmd.template", "rem"),
+    "ps1":   ("windows/manager-alias.ps1.template", "#"),
+}
 _TOKEN_RE = re.compile(r"@[A-Z][A-Z_]*@")
 OWNERSHIP_WINDOW = 4096
 
 
-def read_template(fmt: str, templates_dir: Path = TEMPLATES_DIR) -> str:
-    relpath, _comment = ALIAS_TEMPLATES[fmt]
+def templates_for(slot: str) -> Dict[str, Tuple[str, str]]:
+    return MANAGER_ALIAS_TEMPLATES if slot == SELF else ALIAS_TEMPLATES
+
+
+def read_template(fmt: str, templates_dir: Path = TEMPLATES_DIR, slot: str = DEFAULT) -> str:
+    relpath, _comment = templates_for(slot)[fmt]
     path = templates_dir / relpath
     if not path.is_file():
         raise ManagerError(_("alias template not found at {path}").format(path=path))
@@ -837,28 +959,417 @@ def check_alias_writable(paths: Paths, slot: str, name: str) -> None:
                 "{path} already exists and was not written by {command}. "
                 "Leave it in place and choose another name, for example: "
                 "{command} --alias {current}=<new-name>"
-            ).format(path=paths.display(path), command=COMMAND,
-                     current=default_alias_name(slot)))
+            ).format(path=paths.display(path), command=COMMAND, current=name))
 
 
 def write_alias(paths: Paths, slot: str, name: str,
                 templates_dir: Path = TEMPLATES_DIR) -> List[Path]:
     """Render and atomically write every file of one alias, after checking
     that none of them belongs to someone else."""
-    check_alias_name(name)
+    check_alias_name(name, slot)
     check_alias_writable(paths, slot, name)
     # The bin directory is shared with the distribution and other tools, so
     # it is created if absent but never made owner-only.
     paths.bin_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for path, fmt in paths.alias_files(name):
-        _relpath, comment = ALIAS_TEMPLATES[fmt]
-        text = render_alias(read_template(fmt, templates_dir), comment,
+        _relpath, comment = templates_for(slot)[fmt]
+        text = render_alias(read_template(fmt, templates_dir, slot), comment,
                             paths.display(path), KEY_PREFIX + slot_key(slot))
-        atomic_write_text(path, text, newline=_POINTER_NEWLINE[fmt],
+        atomic_write_text(path, text, newline=_NEWLINE[fmt],
                           mode=EXEC_MODE, windows=paths.windows)
         written.append(path)
     return written
+
+
+def remove_alias(paths: Paths, name: str) -> List[str]:
+    """Delete the files of alias `name` that this manager wrote. Files it did
+    not write are left in place and reported as warnings."""
+    warnings = []
+    for path, _fmt in paths.alias_files(name):
+        owner = alias_owner(path)
+        if owner == "ours":
+            path.unlink()
+        elif owner == "foreign":
+            warnings.append(_("{path} was not written by {command}; left in place")
+                            .format(path=paths.display(path), command=COMMAND))
+    return warnings
+
+
+def write_aliases(paths: Paths, record: PointerRecord, slots: Iterable[str],
+                  templates_dir: Path = TEMPLATES_DIR) -> None:
+    """Write the aliases for `slots`, checking every one before writing any."""
+    slots = list(slots)
+    for slot in slots:
+        check_alias_name(record.alias_name(slot), slot)
+        check_alias_writable(paths, slot, record.alias_name(slot))
+    for slot in slots:
+        for path in write_alias(paths, slot, record.alias_name(slot), templates_dir):
+            log(_("alias written: {path}").format(path=paths.display(path)))
+
+
+# ── Release lookup ────────────────────────────────────────────────────────────
+
+class Build:
+    """One python-build-standalone runtime for one platform."""
+
+    def __init__(self, version: str, build: str, triple: str) -> None:
+        version_key(version)
+        if not build.isdigit():
+            raise ManagerError(_("not a build tag: {build!r}").format(build=build))
+        self.version, self.build, self.triple = version, build, triple
+
+    def __repr__(self) -> str:
+        return f"Build({self.version}+{self.build}, {self.triple})"
+
+    @property
+    def asset(self) -> str:
+        return f"cpython-{self.version}+{self.build}-{self.triple}-{FLAVOR}.tar.gz"
+
+    @property
+    def url(self) -> str:
+        return f"{DOWNLOAD_BASE}/{self.build}/{self.asset}"
+
+    @property
+    def sums_url(self) -> str:
+        return f"{DOWNLOAD_BASE}/{self.build}/SHA256SUMS"
+
+    @property
+    def label(self) -> str:
+        return f"{self.version}+{self.build}"
+
+
+class Network:
+    """The manager's only contact with the outside world, so tests can
+    replace it. A GITHUB_TOKEN in the environment is sent to the GitHub API
+    only, never to download hosts, for a higher rate limit."""
+
+    def __init__(self, environ: Optional[Mapping[str, str]] = None) -> None:
+        env = os.environ if environ is None else environ
+        self.token = env.get("GITHUB_TOKEN") or ""
+        self.user_agent = f"{PROJECT}/{manager_version()}"
+
+    def _open(self, url: str, timeout: int):
+        headers = {"User-Agent": self.user_agent}
+        if url.startswith("https://api.github.com/"):
+            headers["Accept"] = "application/vnd.github+json"
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            if error.code == 403 and "api.github.com" in url:
+                raise ManagerError(_(
+                    "GitHub API rate limit reached. Wait and retry, set GITHUB_TOKEN, "
+                    "or install a pinned build such as 3.12.14+20260924, which needs no API call"
+                )) from None
+            raise ManagerError(_("download failed ({code}) for {url}")
+                               .format(code=error.code, url=url)) from None
+        except (urllib.error.URLError, OSError) as error:
+            raise ManagerError(_("network error for {url}: {error}")
+                               .format(url=url, error=error)) from None
+
+    def get_json(self, url: str):
+        with self._open(url, 30) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def get_text(self, url: str) -> str:
+        with self._open(url, 60) as response:
+            return response.read().decode("utf-8")
+
+    def download(self, url: str, destination: Path) -> None:
+        with self._open(url, 120) as response, open(destination, "wb") as out:
+            shutil.copyfileobj(response, out)
+
+
+def parse_spec(spec: str) -> Tuple[str, str]:
+    """Classify an --install SPEC: ("track", ""), ("minor", "3.13"),
+    ("version", "3.12.14") or ("pinned", "3.12.14+20260924")."""
+    if spec == "":
+        return "track", ""
+    if MINOR_RE.match(spec):
+        return "minor", spec
+    if VERSION_RE.match(spec):
+        return "version", spec
+    if ARCHIVE_RE.match(spec):
+        return "pinned", spec
+    raise UsageError(_(
+        "{spec!r} is not a minor line (3.13), a version (3.12.14) or a build (3.12.14+20260924)"
+    ).format(spec=spec))
+
+
+def builds_in_release(release: Mapping, triple: str) -> List[Build]:
+    """Every install_only_stripped build for `triple` in a release, newest first.
+    Variant triples (x86_64_v3), free-threaded and pre-release builds never match."""
+    pattern = re.compile(r"^cpython-(\d+\.\d+\.\d+)\+(\d+)-" + re.escape(triple)
+                         + "-" + re.escape(FLAVOR) + r"\.tar\.gz$")
+    found = []
+    for asset in release.get("assets", []):
+        match = pattern.match(asset.get("name", ""))
+        if match:
+            found.append(Build(match.group(1), match.group(2), triple))
+    return sorted(found, key=lambda b: (version_key(b.version), int(b.build)), reverse=True)
+
+
+def archived_build(paths: Paths, version: str, triple: str) -> Optional[Build]:
+    """The newest archived build of `version`, if any."""
+    for name in archived_builds(paths):
+        archived_version, build = ARCHIVE_RE.match(name).groups()  # type: ignore[union-attr]
+        if archived_version == version:
+            return Build(version, build, triple)
+    return None
+
+
+def resolve(kind: str, value: str, triple: str, paths: Paths, net: Network,
+            track: str) -> Build:
+    """Turn an --install SPEC into one build. Pinned builds and versions
+    already in the archive need no network; a minor line needs the latest
+    release; a version not in the archive searches recent releases."""
+    if kind == "pinned":
+        version, build = ARCHIVE_RE.match(value).groups()  # type: ignore[union-attr]
+        return Build(version, build, triple)
+    if kind == "version":
+        archived = archived_build(paths, value, triple)
+        if archived:
+            return archived
+        for page in range(1, RELEASE_PAGES + 1):
+            releases = net.get_json(f"{API_BASE}/releases?per_page=30&page={page}")
+            for release in releases:
+                for build in builds_in_release(release, triple):
+                    if build.version == value:
+                        return build
+            if len(releases) < 30:
+                break
+        raise ManagerError(_(
+            "no recent python-build-standalone release has CPython {version} for {triple}"
+        ).format(version=value, triple=triple))
+    minor = value or track
+    release = net.get_json(f"{API_BASE}/releases/latest")
+    builds = [b for b in builds_in_release(release, triple) if minor_of(b.version) == minor]
+    if not builds:
+        raise ManagerError(_(
+            "python-build-standalone release {tag} has no CPython {minor} for {triple}"
+        ).format(tag=release.get("tag_name", "?"), minor=minor, triple=triple))
+    return builds[0]
+
+
+def parse_sha256sums(text: str) -> Dict[str, str]:
+    checksums = {}
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and not parts[0].startswith("#"):
+            checksums[parts[1].lstrip("*")] = parts[0].lower()
+    return checksums
+
+
+# ── Acquisition and extraction ────────────────────────────────────────────────
+
+def acquire(build: Build, paths: Paths, net: Network, workdir: Path) -> Tuple[Path, str, str, bool]:
+    """Archive-first: the verified tarball for `build`, as (path, sha256,
+    source, from_archive). An archived tarball is checked against the
+    checksum recorded beside it; a download against the release's SHA256SUMS."""
+    entry = paths.archive_entry(build.version, build.build)
+    archived = entry / build.asset
+    if archived.is_file():
+        recorded = read_provenance(entry).get("sha256", "")
+        actual = sha256_of(archived)
+        if actual != recorded:
+            raise ManagerError(_(
+                "archived {asset} does not match its recorded checksum; "
+                "not installing it. Move {entry} aside to download it again"
+            ).format(asset=build.asset, entry=paths.display(entry)))
+        log(_("using the archived {label}, verified").format(label=build.label))
+        return archived, actual, f"local archive ({paths.display(archived)})", True
+
+    log(_("downloading SHA256SUMS for release {build}...").format(build=build.build))
+    expected = parse_sha256sums(net.get_text(build.sums_url)).get(build.asset)
+    if not expected:
+        raise ManagerError(_("{asset} is not listed in SHA256SUMS for release {build}; "
+                             "refusing to install unverified")
+                           .format(asset=build.asset, build=build.build))
+    target = workdir / build.asset
+    log(_("downloading {asset}...").format(asset=build.asset))
+    net.download(build.url, target)
+    actual = sha256_of(target)
+    if actual != expected:
+        raise ManagerError(_("checksum mismatch for {asset}: expected {expected}, got {actual}")
+                           .format(asset=build.asset, expected=expected, actual=actual))
+    log(_("verified SHA-256"))
+    return target, actual, build.url, False
+
+
+def _check_member(member: tarfile.TarInfo, destination: Path) -> None:
+    """The safety rules of tarfile's data filter, for Pythons that predate it."""
+    name = PurePosixPath(member.name)
+    if name.is_absolute() or ".." in name.parts:
+        raise ManagerError(_("refusing unsafe path in archive: {name}").format(name=member.name))
+    if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+        raise ManagerError(_("refusing special file in archive: {name}").format(name=member.name))
+    if member.issym() or member.islnk():
+        base = destination / name.parent if member.issym() else destination
+        target = os.path.normpath(str(base / member.linkname))
+        if (PurePosixPath(member.linkname).is_absolute()
+                or not target.startswith(str(destination) + os.sep)):
+            raise ManagerError(_("refusing link that leaves the archive: {name}")
+                               .format(name=member.name))
+
+
+def extract(archive: Path, destination: Path) -> None:
+    with tarfile.open(archive, "r:gz") as tar:
+        if hasattr(tarfile, "data_filter"):
+            try:
+                tar.extractall(destination, filter="data")
+            except tarfile.FilterError as error:
+                raise ManagerError(_("refusing unsafe archive {asset}: {error}")
+                                   .format(asset=archive.name, error=error)) from None
+            return
+        members = tar.getmembers()
+        for member in members:
+            _check_member(member, destination.resolve())
+        tar.extractall(destination, members=members)
+
+
+def health_check(interpreter: Path, version: str) -> None:
+    """Refuse a runtime unless its python starts and reports `version`."""
+    probe = "import sys; print('%d.%d.%d' % sys.version_info[:3])"
+    try:
+        result = subprocess.run([str(interpreter), "-c", probe],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ManagerError(_(
+            "the runtime did not start: {error}. On NixOS, enable nix-ld "
+            "(programs.nix-ld.enable = true)"
+        ).format(error=error)) from None
+    reported = result.stdout.strip()
+    if result.returncode != 0 or reported != version:
+        raise ManagerError(_("the runtime failed its health check: expected {version}, got {reported!r}")
+                           .format(version=version, reported=reported or result.stderr.strip()))
+
+
+EXTERNALLY_MANAGED = """[externally-managed]
+Error=This Python runtime is managed by manage-python and does not accept
+ package installs, so it stays intact for every virtual environment built on it.
+ Create a virtual environment and install into that instead:
+ .
+     python{minor} -m venv .venv
+"""
+
+
+def write_externally_managed(stdlib: Path, version: str, windows: bool) -> None:
+    if not stdlib.is_dir():
+        raise ManagerError(_("standard library directory not found in the runtime: {path}")
+                           .format(path=stdlib))
+    atomic_write_text(stdlib / "EXTERNALLY-MANAGED",
+                      EXTERNALLY_MANAGED.format(minor=minor_of(version)), windows=windows)
+
+
+def install_runtime(build: Build, tarball: Path, sha256: str, source: str,
+                    paths: Paths, now: Optional[datetime] = None,
+                    manager: Optional[str] = None) -> None:
+    """Extract, health-check, protect and record a runtime in a staging
+    directory, then rename it into place, so a failed install leaves nothing."""
+    staging = Path(tempfile.mkdtemp(prefix=f".staging-{build.version}-", dir=str(paths.share_dir)))
+    try:
+        extract(tarball, staging)
+        health_check(paths.interpreter(staging), build.version)
+        write_externally_managed(paths.stdlib_dir(staging, build.version), build.version,
+                                 paths.windows)
+        write_provenance(staging, asset=build.asset, sha256=sha256, source=source,
+                         version=build.version, build=build.build, triple=build.triple,
+                         now=now, windows=paths.windows, manager=manager)
+        if not paths.windows:
+            make_owner_only(staging)
+        os.rename(str(staging), str(paths.runtime_dir(build.version)))
+    except BaseException:
+        if staging.exists():
+            remove_tree(staging)
+        raise
+
+
+def archive_tarball(build: Build, tarball: Path, sha256: str, source: str,
+                    paths: Paths, now: Optional[datetime] = None,
+                    manager: Optional[str] = None) -> None:
+    """Keep a verified tarball, with a PROVENANCE recording its checksum."""
+    ensure_dir(paths.archive_dir, paths.windows)
+    entry = paths.archive_entry(build.version, build.build)
+    staging = Path(tempfile.mkdtemp(prefix=f".staging-{build.label}-", dir=str(paths.archive_dir)))
+    try:
+        shutil.copyfile(str(tarball), str(staging / build.asset))
+        write_provenance(staging, asset=build.asset, sha256=sha256, source=source,
+                         version=build.version, build=build.build, triple=build.triple,
+                         now=now, windows=paths.windows, manager=manager)
+        if not paths.windows:
+            make_owner_only(staging)
+        if entry.exists():
+            remove_tree(entry)
+        os.rename(str(staging), str(entry))
+    except BaseException:
+        if staging.exists():
+            remove_tree(staging)
+        raise
+
+
+# ── The manager itself ────────────────────────────────────────────────────────
+
+# What an installed manager version needs beside the script to run and render aliases.
+SELF_FILES = ["VERSION"] + [f"scripts/{relpath}" for relpath, _c in
+                            list(ALIAS_TEMPLATES.values()) + list(MANAGER_ALIAS_TEMPLATES.values())]
+
+
+def install_self(paths: Paths, source_dir: Path = _HERE,
+                 now: Optional[datetime] = None) -> str:
+    """Install this manager under manage-python/<version>/, unless that
+    version is already there, and return the version."""
+    version = manager_version(source_dir)
+    if not VERSION_RE.match(version):
+        raise ManagerError(_("{path} does not hold a version ({version!r}); cannot install the manager")
+                           .format(path=source_dir / "VERSION", version=version))
+    target = paths.manager_dir / version
+    if target.is_dir():
+        return version
+    ensure_dir(paths.manager_dir, paths.windows)
+    staging = Path(tempfile.mkdtemp(prefix=f".staging-{version}-", dir=str(paths.manager_dir)))
+    try:
+        for relpath in [SCRIPT_NAME] + SELF_FILES:
+            destination = staging / relpath
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(source_dir / relpath), str(destination))
+        locale = source_dir / "locale"
+        if locale.is_dir():
+            shutil.copytree(str(locale), str(staging / "locale"))
+        script = source_dir / SCRIPT_NAME
+        write_provenance(staging, asset=SCRIPT_NAME, sha256=sha256_of(script),
+                         source=f"local copy ({paths.display(script)})", now=now,
+                         windows=paths.windows, manager=version)
+        if not paths.windows:
+            make_owner_only(staging)
+        os.rename(str(staging), str(target))
+    except BaseException:
+        if staging.exists():
+            remove_tree(staging)
+        raise
+    log(_("manager {version} installed: {path}").format(version=version,
+                                                        path=paths.display(target)))
+    return version
+
+
+# ── Operator log ──────────────────────────────────────────────────────────────
+
+def append_log(paths: Paths, action: str, target: str, result: str,
+               now: Optional[datetime] = None) -> None:
+    """One line per lifecycle action: time, action, version, result."""
+    try:
+        ensure_dir(paths.state_dir, paths.windows)
+        line = " ".join([utc_timestamp(now), action, target or "-",
+                         " ".join(result.split())])
+        with open(paths.log_file, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        if not paths.windows:
+            paths.log_file.chmod(FILE_MODE)
+    except (OSError, ManagerError) as error:
+        log(_("warning: could not write {path}: {error}")
+            .format(path=paths.display(paths.log_file), error=error))
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -872,26 +1383,232 @@ def cmd_status(paths: Paths) -> int:
     return 0
 
 
+def cmd_install(spec: str, paths: Paths, net: Network, triple: Optional[str] = None,
+                source_dir: Path = _HERE, templates_dir: Path = TEMPLATES_DIR,
+                now: Optional[datetime] = None) -> str:
+    """Install a runtime and switch to it; install the manager itself on first
+    use. Aliases are checked before any network access. Returns the version."""
+    kind, value = parse_spec(spec)
+    record = read_pointer(paths)
+    track = minor_of(record.default) if record.default else DEFAULT_TRACK
+    minor = {"track": track, "minor": value}.get(kind) or minor_of(value.split("+")[0])
+
+    plan = record.copy()
+    install_manager = not (plan.self_version and (paths.manager_dir / plan.self_version).is_dir())
+    # Every alias this install will write, checked before any network access.
+    slots = [DEFAULT, minor, SELF] + [s for s in plan.active_slots() if s not in (DEFAULT, minor, SELF)]
+    for slot in slots:
+        check_alias_name(plan.alias_name(slot), slot)
+        check_alias_writable(paths, slot, plan.alias_name(slot))
+
+    triple = triple or detect_triple()
+    build = resolve(kind, value, triple, paths, net, track)
+    log(_("selected CPython {label} ({triple})").format(label=build.label, triple=triple))
+
+    ensure_dir(paths.share_dir, paths.windows)
+    if paths.runtime_dir(build.version).is_dir():
+        log(_("{version} is already installed").format(version=build.version))
+    else:
+        workdir = Path(tempfile.mkdtemp(prefix=".download-", dir=str(paths.share_dir)))
+        try:
+            tarball, sha256, source, from_archive = acquire(build, paths, net, workdir)
+            log(_("installing to {path}...").format(path=paths.display(paths.runtime_dir(build.version))))
+            running = manager_version(source_dir)
+            install_runtime(build, tarball, sha256, source, paths, now, running)
+            if not from_archive:
+                archive_tarball(build, tarball, sha256, source, paths, now, running)
+        finally:
+            remove_tree(workdir)
+
+    if install_manager:
+        plan.self_version = install_self(paths, source_dir, now)
+    elif plan.self_version != manager_version(source_dir):
+        log(_("manager {installed} stays in use; this is {running}. Self-update is not yet available")
+            .format(installed=plan.self_version, running=manager_version(source_dir)))
+    plan.switch(build.version)
+    write_pointer(plan, paths)
+    write_aliases(paths, plan, plan.active_slots(), templates_dir)
+    log(_("CPython {version} installed; python and {alias} now run it")
+        .format(version=build.version, alias=plan.alias_name(minor)))
+    path_notes(paths)
+    return build.version
+
+
+def path_notes(paths: Paths) -> None:
+    entries = [Path(p) for p in paths.environ.get("PATH", "").split(os.pathsep) if p]
+    if paths.bin_dir in entries:
+        return
+    if paths.windows:
+        log(_("{path} is not on your PATH. Add it to the user PATH, ahead of "
+              "%LOCALAPPDATA%\\Microsoft\\WindowsApps, and open a new terminal")
+            .format(path=paths.display(paths.bin_dir)))
+    elif platform.system() == "Darwin":
+        log(_("{path} is not on your PATH. Add this line to ~/.zshrc and open a new terminal:\n"
+              "    export PATH=\"$HOME/.local/bin:$PATH\"").format(path=paths.display(paths.bin_dir)))
+    else:
+        log(_("{path} is not on your PATH yet. Log in again, or run: . ~/.profile")
+            .format(path=paths.display(paths.bin_dir)))
+
+
+def cmd_switch(version: str, paths: Paths, templates_dir: Path = TEMPLATES_DIR) -> str:
+    if not VERSION_RE.match(version):
+        raise UsageError(_("--switch takes a full version such as 3.12.14, not {version!r}")
+                         .format(version=version))
+    if not paths.runtime_dir(version).is_dir():
+        raise ManagerError(_("{version} is not installed; install it with: {command} --install {version}")
+                           .format(version=version, command=COMMAND))
+    record = read_pointer(paths).copy()
+    record.switch(version)
+    slots = [DEFAULT, minor_of(version)]
+    for slot in slots:
+        check_alias_writable(paths, slot, record.alias_name(slot))
+    write_pointer(record, paths)
+    write_aliases(paths, record, slots, templates_dir)
+    log(_("python and {alias} now run {version}")
+        .format(alias=record.alias_name(minor_of(version)), version=version))
+    return version
+
+
+def cmd_remove(version: str, paths: Paths) -> str:
+    if not VERSION_RE.match(version):
+        raise UsageError(_("--remove takes a full version such as 3.12.13, not {version!r}")
+                         .format(version=version))
+    runtime = paths.runtime_dir(version)
+    if not runtime.is_dir():
+        raise ManagerError(_("{version} is not installed").format(version=version))
+    record = read_pointer(paths).copy()
+    minor = minor_of(version)
+    if record.default == version:
+        raise ManagerError(_("{version} is the default version, which {alias} and the manager "
+                             "run on. Switch to another version first")
+                           .format(version=version, alias=record.alias_name(DEFAULT)))
+    stale_alias = None
+    if record.lines.get(minor) == version:
+        others = [v for v in installed_versions(paths) if minor_of(v) == minor and v != version]
+        if others:
+            raise ManagerError(_(
+                "{alias} runs {version}. Point it at {other} first with "
+                "--switch {other}, then --switch {default} to move python back"
+            ).format(alias=record.alias_name(minor), version=version, other=others[0],
+                     default=record.default))
+        # The last version of its line: the line's alias goes with it. A
+        # renamed alias keeps its name in the pointer for a later install.
+        stale_alias = record.alias_name(minor)
+        del record.lines[minor]
+        write_pointer(record, paths)
+        for warning in remove_alias(paths, stale_alias):
+            log(_("warning: {message}").format(message=warning))
+    log(_("virtual environments created with {version} stop working until it is reinstalled")
+        .format(version=version))
+    trash = Path(tempfile.mkdtemp(prefix=f".removing-{version}-", dir=str(paths.share_dir)))
+    os.rename(str(runtime), str(trash / version))
+    remove_tree(trash)
+    log(_("{version} removed").format(version=version)
+        + (_("; alias {alias} removed with it").format(alias=stale_alias) if stale_alias else ""))
+    archived = archived_build(paths, version, "")
+    if archived:
+        log(_("its verified tarball remains in the archive; reinstall offline with: "
+              "{command} --install {label}").format(command=COMMAND, label=archived.label))
+    return version
+
+
+def cmd_alias(spec: str, paths: Paths, templates_dir: Path = TEMPLATES_DIR) -> str:
+    """Rename an alias. OLD is its current name, or, for an alias not yet
+    written, its default name, so a collision can be avoided before an install."""
+    old, sep, new = spec.partition("=")
+    if not sep or not old or not new:
+        raise UsageError(_("--alias takes OLD=NEW, for example python3.12=py312"))
+    record = read_pointer(paths)
+    slot = record.slot_named(old)
+    if slot is None:
+        defaults = {DEFAULT_NAME: DEFAULT, COMMAND: SELF}
+        match = re.fullmatch(r"python(\d+\.\d+)", old)
+        slot = defaults.get(old) or (match.group(1) if match else None)
+        if slot is None or slot in record.active_slots():
+            raise ManagerError(_("there is no alias named {name}").format(name=old))
+    if record.alias_name(slot) == new:
+        log(_("{name} is already called {name}").format(name=new))
+        return new
+    updated = record.copy()
+    updated.aliases[slot] = new
+    updated.validate()
+    active = slot in updated.active_slots()
+    if active:
+        check_alias_writable(paths, slot, new)
+    write_pointer(updated, paths)
+    if active:
+        write_aliases(paths, updated, [slot], templates_dir)
+        for warning in remove_alias(paths, record.alias_name(slot)):
+            log(_("warning: {message}").format(message=warning))
+    log(_("{old} is now {new}").format(old=record.alias_name(slot), new=new))
+    return new
+
+
+def root_guard() -> None:
+    """Refuse to change anything as root or Administrator: everything this
+    manager writes belongs to the invoking user."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise ManagerError(_("this manager writes to your home directory; do not run it with sudo"))
+    if os.name == "nt":
+        try:
+            import ctypes
+            if ctypes.windll.shell32.IsUserAnAdmin():  # type: ignore[attr-defined]
+                raise ManagerError(_("this manager writes to your profile; do not run it as Administrator"))
+        except (AttributeError, OSError):
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog=COMMAND,
         description=_("Manage user-space installations of CPython."),
     )
-    parser.add_argument("--status", action="store_true",
-                        help=_("Show aliases, default, installed and archived versions."))
-    parser.add_argument("--version", action="store_true",
-                        help=_("Show this manager's version and exit."))
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--install", nargs="?", const="", metavar="SPEC",
+                         help=_("Install and switch to a runtime: 3.13, 3.12.14 or 3.12.14+20260924 "
+                                "(default: latest of the default minor line)."))
+    actions.add_argument("--switch", metavar="VERSION",
+                         help=_("Make an installed version the one python and its minor alias run."))
+    actions.add_argument("--status", action="store_true",
+                         help=_("Show aliases, default, installed and archived versions."))
+    actions.add_argument("--remove", metavar="VERSION",
+                         help=_("Remove an installed version no alias needs; the archive is kept."))
+    actions.add_argument("--alias", metavar="OLD=NEW",
+                         help=_("Rename an alias, for example python3.12=py312."))
+    actions.add_argument("--version", action="store_true",
+                         help=_("Show this manager's version and exit."))
     args = parser.parse_args(argv)
 
-    try:
-        if args.version:
-            print(f"{COMMAND} {MANAGER_VERSION}")
-            return 0
-        if args.status:
+    if args.version:
+        print(f"{COMMAND} {manager_version()}")
+        return 0
+    if args.status:
+        try:
             return cmd_status(Paths())
-    except ManagerError as error:
-        log(_("ERROR: {message}").format(message=error))
-        return 1
+        except ManagerError as error:
+            log(_("ERROR: {message}").format(message=error))
+            return 1
+
+    lifecycle = [("install", args.install, lambda p: cmd_install(args.install, p, Network())),
+                 ("switch", args.switch, lambda p: cmd_switch(args.switch, p)),
+                 ("remove", args.remove, lambda p: cmd_remove(args.remove, p)),
+                 ("alias", args.alias, lambda p: cmd_alias(args.alias, p))]
+    for action, value, run in lifecycle:
+        if value is None:
+            continue
+        paths = Paths()
+        try:
+            root_guard()
+            result = run(paths)
+        except UsageError as error:
+            log(_("ERROR: {message}").format(message=error))
+            return 2                                # not an action, so not logged
+        except ManagerError as error:
+            log(_("ERROR: {message}").format(message=error))
+            append_log(paths, action, value, f"failed: {error}")
+            return 1
+        append_log(paths, action, result, "ok")
+        return 0
     parser.print_usage(sys.stderr)
     return 2
 

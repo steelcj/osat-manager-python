@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# source
+#   project: osat-manager-python
+#   path: scripts/nix/manager-alias.template
+# generates
+#   path: @ALIAS_PATH@
+#
+# Do not edit generated aliases; regenerated on --install, --switch and --alias.
+# Sources the manager pointer, then the operator environment (owned by the
+# operator, never touched by the manager), then runs the manager version the
+# pointer names on the default runtime, passing every argument through.
+_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/python-manager"
+_share="${XDG_DATA_HOME:-$HOME/.local/share}/python-manager"
+. "$_cfg/python-manager.env"
+[ -f "$_cfg/env" ] && . "$_cfg/env"
+exec "$_share/${PYTHON_MANAGER_DEFAULT:?not set in $_cfg/python-manager.env}/python/bin/python3" "$_share/manage-python/${PYTHON_MANAGER_SELF:?not set in $_cfg/python-manager.env}/manage-python.py" "$@"

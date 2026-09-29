@@ -12,6 +12,7 @@ Usage:
     python3 -m unittest test_manage_python -v
 """
 
+import hashlib
 import importlib.util
 import io
 import os
@@ -20,6 +21,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -192,6 +194,12 @@ class TestPointerRecord(unittest.TestCase):
         with self.assertRaises(mp.ManagerError):
             record.validate()
 
+    def test_manage_python_is_reserved_for_the_manager(self):
+        mp.check_alias_name("manage-python", mp.SELF)
+        for slot in (mp.DEFAULT, "3.12", None):
+            with self.subTest(slot=slot), self.assertRaises(mp.ManagerError):
+                mp.check_alias_name("Manage-Python", slot)
+
     def test_alias_name_rules(self):
         for good in ("python", "py312", "python3.12", "py-3.12", "py_312", "cpython+"):
             mp.check_alias_name(good)
@@ -360,7 +368,8 @@ class TestProvenance(Scratch):
         return mp.write_provenance(self.tmp, **args)
 
     def test_runtime_provenance_matches_proposal(self):
-        path = self.write_runtime()
+        with mock.patch.object(mp, "manager_version", return_value="0.3.0"):
+            path = self.write_runtime()
         self.assertEqual(path.read_text(encoding="utf-8"),
                          "manager: manage-python 0.3.0\n"
                          f"asset: {self.ASSET}\n"
@@ -699,11 +708,26 @@ class TestStatus(Scratch):
 
 class TestCli(unittest.TestCase):
 
-    def test_version(self):
+    def test_version_comes_from_the_version_file(self):
         out = io.StringIO()
         with redirect_stdout(out):
             self.assertEqual(mp.main(["--version"]), 0)
-        self.assertEqual(out.getvalue(), "manage-python 0.3.0\n")
+        expected = (_SCRIPT.parent / "VERSION").read_text().strip()
+        self.assertEqual(out.getvalue(), f"manage-python {expected}\n")
+
+    def test_no_version_constant(self):
+        self.assertFalse(hasattr(mp, "MANAGER_VERSION"))
+
+    def test_manager_version_reads_its_own_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(mp.manager_version(Path(tmp)), "unknown")
+            (Path(tmp) / "VERSION").write_text("0.3.0\n")
+            self.assertEqual(mp.manager_version(Path(tmp)), "0.3.0")
+
+    def test_actions_are_mutually_exclusive(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            mp.main(["--status", "--version"])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_no_action_is_usage_error(self):
         err = io.StringIO()
@@ -748,15 +772,20 @@ class TestAliasRendering(Scratch):
         self.assertIn("rem generated\nrem   path: %LOCALAPPDATA%\\Programs\\python3.12.cmd\n"
                       "rem   by: manage-python.py\n", cmd)
         self.assertIn("setlocal\n", cmd)
-        self.assertIn(r'"%LOCALAPPDATA%\python-manager\%PYTHON_MANAGER_3_12%\python\python.exe" %*',
-                      cmd)
+        self.assertIn(r'"%LOCALAPPDATA%\python-manager\%PYTHON_MANAGER_3_12%\python\python.exe" %*'
+                      "\nexit /b %ERRORLEVEL%\n", cmd)
+        self.assertIn("if not defined PYTHON_MANAGER_3_12 goto :unset\n", cmd)
         self.assertLess(cmd.index("python-manager.env.cmd"), cmd.index("env.cmd\" call"))
 
         ps1 = mp.render_alias(mp.read_template("ps1"), "#",
                               r"%LOCALAPPDATA%\Programs\python3.12.ps1", "PYTHON_MANAGER_3_12")
         self.assertIn("#   by: manage-python.py\n", ps1)
         self.assertIn(r"\$env:PYTHON_MANAGER_3_12\python\python.exe" + '" @args', ps1)
-        self.assertIn("exit $LASTEXITCODE", ps1)
+        self.assertIn("$osatExit = $LASTEXITCODE", ps1)
+        self.assertTrue(ps1.endswith("}\nexit $osatExit\n"))
+        self.assertLess(ps1.index("$osatSnapshot = @{}"), ps1.index("python-manager.env.ps1"))
+        self.assertLess(ps1.index("python-manager.env.ps1"), ps1.index('env.ps1") {'))
+        self.assertLess(ps1.index("finally {"), ps1.index("exit $osatExit"))
 
     def test_generic_alias_reads_default_key(self):
         text = mp.render_alias(mp.read_template("posix"), "#", "~/.local/bin/python",
@@ -923,6 +952,742 @@ class TestPosixAliasEndToEnd(Scratch):
         result = self.run_alias()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PYTHON_MANAGER_3_12", result.stderr)
+
+
+# ── SELF: the manager's own alias ─────────────────────────────────────────────
+
+class TestSelfPointer(Scratch):
+
+    def record(self):
+        return mp.PointerRecord(default="3.12.14", lines={"3.12": "3.12.14"},
+                                self_version="0.3.0")
+
+    def test_self_keys_round_trip_in_every_format(self):
+        paths = self.windows_paths()
+        for fmt in ("posix", "cmd", "ps1"):
+            with self.subTest(fmt=fmt):
+                text = mp.render_pointer(self.record(), fmt, paths)
+                self.assertEqual(mp.parse_pointer(text, fmt), self.record())
+
+    def test_key_order(self):
+        self.assertEqual(self.record().to_items(), [
+            ("PYTHON_MANAGER_DEFAULT", "3.12.14"), ("PYTHON_MANAGER_3_12", "3.12.14"),
+            ("PYTHON_MANAGER_SELF", "0.3.0"),
+            ("PYTHON_MANAGER_ALIAS_DEFAULT", "python"), ("PYTHON_MANAGER_ALIAS_3_12", "python3.12"),
+            ("PYTHON_MANAGER_ALIAS_SELF", "manage-python")])
+
+    def test_switch_never_changes_the_manager_version(self):
+        record = self.record()
+        record.switch("3.13.1")
+        self.assertEqual(record.self_version, "0.3.0")
+
+    def test_self_version_must_be_a_version(self):
+        with self.assertRaises(mp.ManagerError):
+            mp.parse_pointer('PYTHON_MANAGER_SELF="latest"\n', "posix")
+
+    def test_manager_alias_can_be_renamed_but_not_taken(self):
+        record = self.record()
+        record.aliases[mp.SELF] = "mp"
+        record.validate()
+        record.aliases["3.12"] = "manage-python"
+        with self.assertRaises(mp.ManagerError):
+            record.validate()
+
+
+class TestManagerAlias(Scratch):
+
+    def test_posix_render(self):
+        text = mp.render_alias(mp.read_template("posix", slot=mp.SELF), "#",
+                               "~/.local/bin/manage-python", "PYTHON_MANAGER_SELF")
+        self.assertIn("#   path: scripts/nix/manager-alias.template\n# generated\n"
+                      "#   path: ~/.local/bin/manage-python\n#   by: manage-python.py\n", text)
+        self.assertIn('_share="${XDG_DATA_HOME:-$HOME/.local/share}/python-manager"\n', text)
+        self.assertIn('exec "$_share/${PYTHON_MANAGER_DEFAULT:?not set in $_cfg/python-manager.env}'
+                      '/python/bin/python3" "$_share/manage-python/${PYTHON_MANAGER_SELF:?not set in '
+                      '$_cfg/python-manager.env}/manage-python.py" "$@"\n', text)
+
+    def test_windows_render(self):
+        cmd = mp.render_alias(mp.read_template("cmd", slot=mp.SELF), "rem", "p", "PYTHON_MANAGER_SELF")
+        self.assertIn(r'"%LOCALAPPDATA%\python-manager\%PYTHON_MANAGER_DEFAULT%\python\python.exe" '
+                      r'"%LOCALAPPDATA%\python-manager\manage-python\%PYTHON_MANAGER_SELF%'
+                      r'\manage-python.py" %*', cmd)
+        self.assertIn("if not defined PYTHON_MANAGER_SELF goto :unset", cmd)
+        ps1 = mp.render_alias(mp.read_template("ps1", slot=mp.SELF), "#", "p", "PYTHON_MANAGER_SELF")
+        self.assertIn(r'\manage-python\$env:PYTHON_MANAGER_SELF\manage-python.py" @args', ps1)
+        self.assertIn("finally {", ps1)
+        self.assertTrue(ps1.endswith("exit $osatExit\n"))
+
+    def test_write_alias_uses_manager_template(self):
+        paths = self.posix_paths()
+        [path] = mp.write_alias(paths, mp.SELF, "manage-python")
+        self.assertIn("PYTHON_MANAGER_SELF", path.read_text())
+        self.assertEqual(mp.alias_owner(path), "ours")
+
+    @POSIX_ONLY
+    def test_runs_the_named_manager_on_the_default_runtime(self):
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
+               "XDG_DATA_HOME": str(self.tmp / "data"), "XDG_CONFIG_HOME": str(self.tmp / "config")}
+        paths = mp.Paths(windows=False, environ=env, home=self.home)
+        runtime = paths.interpreter(paths.runtime_dir("3.12.14"))
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text('#!/bin/sh\nprintf "%s|" "3.12.14" "$@"\nexit 4\n')
+        runtime.chmod(0o700)
+        (paths.manager_dir / "0.3.0").mkdir(parents=True)
+        mp.write_pointer(mp.PointerRecord(default="3.12.14", lines={"3.12": "3.12.14"},
+                                          self_version="0.3.0"), paths)
+        [alias] = mp.write_alias(paths, mp.SELF, "manage-python")
+        result = subprocess.run([str(alias), "--status"], env=env, capture_output=True, text=True)
+        script = paths.manager_dir / "0.3.0" / "manage-python.py"
+        self.assertEqual(result.stdout, f"3.12.14|{script}|--status|")
+        self.assertEqual(result.returncode, 4)
+
+        mp.write_pointer(mp.PointerRecord(default="3.12.14", lines={"3.12": "3.12.14"}), paths)
+        result = subprocess.run([str(alias)], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PYTHON_MANAGER_SELF", result.stderr)
+
+
+@unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed")
+class TestPowerShellAliasRestoresEnvironment(Scratch):
+    """The .ps1 alias must leave the calling session's environment as it was."""
+
+    def test_session_environment_unchanged(self):
+        paths = self.windows_paths()
+        local = self.home / "AppData" / "Local"
+        roaming = self.home / "AppData" / "Roaming"
+        exe = paths.runtime_dir("3.12.14") / "python" / "python.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_text('#!/bin/sh\necho "runtime $*"\nexit 7\n')
+        exe.chmod(0o700)
+        mp.write_pointer(mp.PointerRecord(default="3.12.14", lines={"3.12": "3.12.14"}), paths)
+        paths.config_dir.mkdir(parents=True)
+        (paths.config_dir / "env.ps1").write_text(
+            '$env:OSAT_KEEP = "changed-by-operator"\n$env:OSAT_ADDED = "added-by-operator"\n')
+        [_cmd, ps1] = mp.write_alias(paths, "3.12", "python3.12")
+        session = f"""
+$env:LOCALAPPDATA = '{local}'
+$env:APPDATA = '{roaming}'
+$env:OSAT_KEEP = 'before'
+function Snap {{ (Get-ChildItem Env: | Sort-Object Name | ForEach-Object {{ "$($_.Name)=$($_.Value)" }}) -join "`n" }}
+$before = Snap
+& '{ps1}' first second
+$code = $LASTEXITCODE
+$after = Snap
+if ($before -cne $after) {{ Write-Output "CHANGED"; exit 90 }}
+exit $code
+"""
+        result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", session],
+                                capture_output=True, text=True, timeout=120)
+        self.assertNotIn("CHANGED", result.stdout, result.stderr)
+        self.assertIn("runtime first second", result.stdout)
+        self.assertEqual(result.returncode, 7, result.stderr)
+
+
+# ── Lifecycle fixtures ────────────────────────────────────────────────────────
+
+TRIPLE = "x86_64-unknown-linux-gnu"
+
+
+def runtime_tarball(path, version, reports=None, windows=False, extra=None):
+    """A stand-in for a python-build-standalone install_only tarball: an
+    interpreter script that reports a version, and a standard library directory."""
+    minor = ".".join(version.split(".")[:2])
+    script = '#!/bin/sh\necho "{}"\n'.format(reports or version).encode()
+    with tarfile.open(path, "w:gz") as tar:
+        def add(name, data=b"", mode=0o644, kind=tarfile.REGTYPE, link=""):
+            info = tarfile.TarInfo(name)
+            info.type, info.mode, info.size, info.linkname = kind, mode, len(data), link
+            tar.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+        add("python", kind=tarfile.DIRTYPE, mode=0o755)
+        if windows:
+            add("python/python.exe", script, 0o755)
+            add("python/Lib", kind=tarfile.DIRTYPE, mode=0o755)
+            add("python/Lib/os.py", b"# os\n")
+        else:
+            add("python/bin", kind=tarfile.DIRTYPE, mode=0o755)
+            add(f"python/bin/python{minor}", script, 0o755)
+            add("python/bin/python3", kind=tarfile.SYMTYPE, link=f"python{minor}")
+            add(f"python/lib/python{minor}", kind=tarfile.DIRTYPE, mode=0o755)
+            add(f"python/lib/python{minor}/os.py", b"# os\n")
+        for name, data in (extra or {}).items():
+            add(name, data)
+    return path.read_bytes()
+
+
+class FakeNetwork:
+    """Serves releases, SHA256SUMS and tarballs from memory and records every URL."""
+
+    def __init__(self):
+        self.files = {}
+        self.releases = {}          # build tag -> release dict
+        self.calls = []
+        self.offline = False
+
+    def publish(self, build, data, sums=None):
+        asset = build.asset
+        self.files[build.url] = data
+        digest = sums or hashlib.sha256(data).hexdigest()
+        existing = self.files.get(build.sums_url, b"").decode()
+        self.files[build.sums_url] = (existing + f"{digest}  {asset}\n").encode()
+        release = self.releases.setdefault(build.build, {"tag_name": build.build, "assets": []})
+        release["assets"].append({"name": asset})
+        release["assets"].append({"name": asset.replace(build.triple, "x86_64_v3-unknown-linux-gnu")})
+
+    def _call(self, url):
+        self.calls.append(url)
+        if self.offline:
+            raise mp.ManagerError(f"network error for {url}: offline")
+
+    def get_json(self, url):
+        self._call(url)
+        ordered = [self.releases[k] for k in sorted(self.releases, reverse=True)]
+        if url.endswith("/releases/latest"):
+            return ordered[0]
+        page = int(url.rsplit("page=", 1)[1])
+        return ordered[(page - 1) * 30:page * 30]
+
+    def get_text(self, url):
+        self._call(url)
+        return self.files[url].decode()
+
+    def download(self, url, destination):
+        self._call(url)
+        destination.write_bytes(self.files[url])
+
+    def api_calls(self):
+        return [c for c in self.calls if c.startswith("https://api.github.com/")]
+
+
+class Lifecycle(Scratch):
+    """A scratch home, a fake network and a manager release directory at 0.3.0."""
+
+    NOW = datetime(2026, 9, 29, 14, 2, 11, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = str(self.tmp / "bin")
+        self.env = {"HOME": str(self.home), "PATH": bin_dir + os.pathsep + "/usr/bin:/bin",
+                    "XDG_DATA_HOME": str(self.tmp / "data"),
+                    "XDG_CONFIG_HOME": str(self.tmp / "config"),
+                    "XDG_STATE_HOME": str(self.tmp / "state"),
+                    "XDG_BIN_HOME": bin_dir}
+        self.paths = mp.Paths(windows=False, environ=self.env, home=self.home)
+        self.net = FakeNetwork()
+        self.source = self.tmp / "release"
+        self.make_source("0.3.0")
+        self.err = io.StringIO()
+        patcher = redirect_stderr(self.err)
+        patcher.__enter__()
+        self.addCleanup(patcher.__exit__, None, None, None)
+
+    def make_source(self, version):
+        """A downloaded manager release: the script, VERSION and templates."""
+        if self.source.exists():
+            shutil.rmtree(self.source)
+        (self.source / "scripts").mkdir(parents=True)
+        shutil.copyfile(_SCRIPT, self.source / "manage-python.py")
+        for sub in ("nix", "windows"):
+            shutil.copytree(_SCRIPT.parent / "scripts" / sub, self.source / "scripts" / sub)
+        (self.source / "VERSION").write_text(version + "\n")
+
+    def publish(self, label, windows=False, reports=None, extra=None, triple=TRIPLE, sums=None):
+        version, build = label.split("+")
+        data = runtime_tarball(self.tmp / f"{label}.tar.gz", version,
+                               reports=reports, windows=windows, extra=extra)
+        self.net.publish(mp.Build(version, build, triple), data, sums=sums)
+        return data
+
+    def install(self, spec="", paths=None, triple=TRIPLE):
+        return mp.cmd_install(spec, paths or self.paths, self.net, triple=triple,
+                              source_dir=self.source, now=self.NOW)
+
+    def pointer(self):
+        return mp.read_pointer(self.paths)
+
+    def status(self):
+        lines, _warnings = mp.collect_status(self.paths, self.pointer())
+        return mp.format_status(lines)
+
+    def share_entries(self):
+        return sorted(os.listdir(self.paths.share_dir))
+
+
+# ── --install ─────────────────────────────────────────────────────────────────
+
+class TestParseSpec(unittest.TestCase):
+
+    def test_forms(self):
+        self.assertEqual(mp.parse_spec(""), ("track", ""))
+        self.assertEqual(mp.parse_spec("3.13"), ("minor", "3.13"))
+        self.assertEqual(mp.parse_spec("3.12.14"), ("version", "3.12.14"))
+        self.assertEqual(mp.parse_spec("3.12.14+20260924"), ("pinned", "3.12.14+20260924"))
+
+    def test_rejects_everything_else(self):
+        for spec in ("3", "latest", "3.12.14+", "v3.12.14", "3.14.0rc1", "3.12.14+abc", "../3.12"):
+            with self.subTest(spec=spec), self.assertRaises(mp.UsageError):
+                mp.parse_spec(spec)
+
+
+class TestReleaseLookup(Lifecycle):
+
+    def test_builds_in_release_ignores_variants_and_other_flavours(self):
+        release = {"assets": [{"name": n} for n in (
+            f"cpython-3.12.14+20260924-{TRIPLE}-install_only_stripped.tar.gz",
+            f"cpython-3.12.13+20260924-{TRIPLE}-install_only_stripped.tar.gz",
+            "cpython-3.12.14+20260924-x86_64_v3-unknown-linux-gnu-install_only_stripped.tar.gz",
+            f"cpython-3.12.14+20260924-{TRIPLE}-install_only.tar.gz",
+            f"cpython-3.13.1+20260924-{TRIPLE}-freethreaded-install_only_stripped.tar.gz",
+            f"cpython-3.14.0rc1+20260924-{TRIPLE}-install_only_stripped.tar.gz",
+            "SHA256SUMS")]}
+        self.assertEqual([b.label for b in mp.builds_in_release(release, TRIPLE)],
+                         ["3.12.14+20260924", "3.12.13+20260924"])
+
+    def test_build_urls(self):
+        build = mp.Build("3.12.14", "20260924", TRIPLE)
+        self.assertEqual(build.url, "https://github.com/astral-sh/python-build-standalone/releases/"
+                         "download/20260924/cpython-3.12.14+20260924-x86_64-unknown-linux-gnu-"
+                         "install_only_stripped.tar.gz")
+        self.assertTrue(build.sums_url.endswith("/download/20260924/SHA256SUMS"))
+
+    def test_minor_line_takes_newest_patch_of_latest_release(self):
+        self.publish("3.13.14+20260801")
+        self.publish("3.13.15+20260924")
+        self.publish("3.12.14+20260924")
+        build = mp.resolve("minor", "3.13", TRIPLE, self.paths, self.net, "3.12")
+        self.assertEqual(build.label, "3.13.15+20260924")
+        self.assertEqual(self.net.api_calls(), [f"{mp.API_BASE}/releases/latest"])
+
+    def test_track_uses_the_given_minor(self):
+        self.publish("3.12.14+20260924")
+        self.publish("3.13.15+20260924")
+        self.assertEqual(mp.resolve("track", "", TRIPLE, self.paths, self.net, "3.12").version,
+                         "3.12.14")
+
+    def test_pinned_needs_no_network(self):
+        build = mp.resolve("pinned", "3.12.14+20260924", TRIPLE, self.paths, self.net, "3.12")
+        self.assertEqual(build.label, "3.12.14+20260924")
+        self.assertEqual(self.net.calls, [])
+
+    def test_version_searches_older_releases(self):
+        self.publish("3.12.12+20260715")
+        self.publish("3.12.14+20260924")
+        build = mp.resolve("version", "3.12.12", TRIPLE, self.paths, self.net, "3.12")
+        self.assertEqual(build.label, "3.12.12+20260715")
+
+    def test_version_found_in_archive_needs_no_network(self):
+        (self.paths.archive_dir / "3.12.12+20260601").mkdir(parents=True)
+        (self.paths.archive_dir / "3.12.12+20260715").mkdir(parents=True)
+        build = mp.resolve("version", "3.12.12", TRIPLE, self.paths, self.net, "3.12")
+        self.assertEqual(build.label, "3.12.12+20260715")
+        self.assertEqual(self.net.calls, [])
+
+    def test_not_found(self):
+        self.publish("3.12.14+20260924")
+        with self.assertRaisesRegex(mp.ManagerError, "3.11.2"):
+            mp.resolve("version", "3.11.2", TRIPLE, self.paths, self.net, "3.12")
+        with self.assertRaisesRegex(mp.ManagerError, "no CPython 3.9"):
+            mp.resolve("minor", "3.9", TRIPLE, self.paths, self.net, "3.12")
+
+    def test_parse_sha256sums(self):
+        sums = mp.parse_sha256sums("AB  file-a\n# comment\ncd *file-b\n\nbroken\n")
+        self.assertEqual(sums, {"file-a": "ab", "file-b": "cd"})
+
+
+class TestInstall(Lifecycle):
+
+    def test_first_install(self):
+        data = self.publish("3.12.14+20260924")
+        self.assertEqual(self.install(), "3.12.14")
+        build = mp.Build("3.12.14", "20260924", TRIPLE)
+        digest = hashlib.sha256(data).hexdigest()
+
+        runtime = self.paths.runtime_dir("3.12.14")
+        self.assertTrue((runtime / "python" / "bin" / "python3").exists())
+        self.assertEqual(mp.read_provenance(runtime), {
+            "manager": "manage-python 0.3.0", "asset": build.asset, "sha256": digest,
+            "source": build.url, "installed": "2026-09-29T14:02:11Z", "version": "3.12.14",
+            "build": "20260924", "triple": TRIPLE})
+        marker = runtime / "python" / "lib" / "python3.12" / "EXTERNALLY-MANAGED"
+        self.assertIn("python3.12 -m venv .venv", marker.read_text())
+        self.assertTrue(marker.read_text().startswith("[externally-managed]\nError="))
+
+        entry = self.paths.archive_entry("3.12.14", "20260924")
+        self.assertEqual(mp.sha256_of(entry / build.asset), digest)
+        self.assertEqual(mp.read_provenance(entry)["sha256"], digest)
+
+        self.assertEqual(self.pointer(), mp.PointerRecord(
+            default="3.12.14", lines={"3.12": "3.12.14"}, self_version="0.3.0"))
+        for name in ("python", "python3.12", "manage-python"):
+            self.assertEqual(mp.alias_owner(self.paths.bin_dir / name), "ours", name)
+
+        manager = self.paths.manager_dir / "0.3.0"
+        self.assertEqual((manager / "VERSION").read_text(), "0.3.0\n")
+        self.assertTrue((manager / "manage-python.py").is_file())
+        self.assertTrue((manager / "scripts" / "nix" / "manager-alias.template").is_file())
+        self.assertEqual(mp.manager_version(manager), "0.3.0")
+        self.assertEqual(mp.read_provenance(manager)["sha256"],
+                         mp.sha256_of(self.source / "manage-python.py"))
+
+        self.assertEqual(self.share_entries(), ["3.12.14", "archive", "manage-python"])
+        self.assertEqual(self.status(), "3.12\n  aliases     python3.12  python\n"
+                                        "    default     3.12.14\n")
+
+    @POSIX_ONLY
+    def test_installed_tree_is_owner_only(self):
+        self.publish("3.12.14+20260924")
+        self.install()
+        for root in (self.paths.runtime_dir("3.12.14"), self.paths.manager_dir / "0.3.0",
+                     self.paths.archive_entry("3.12.14", "20260924")):
+            for path in [root, *root.rglob("*")]:
+                if not path.is_symlink():
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0, path)
+
+    def test_minor_line_install_moves_python_and_keeps_other_lines(self):
+        self.publish("3.12.14+20260924")
+        self.publish("3.13.15+20260924")
+        self.install()
+        self.assertEqual(self.install("3.13"), "3.13.15")
+        record = self.pointer()
+        self.assertEqual(record.default, "3.13.15")
+        self.assertEqual(record.lines, {"3.12": "3.12.14", "3.13": "3.13.15"})
+        self.assertTrue((self.paths.bin_dir / "python3.13").exists())
+
+    def test_default_track_follows_the_current_default(self):
+        self.publish("3.13.15+20260924")
+        self.publish("3.12.14+20260924")
+        self.install("3.13")
+        self.assertEqual(self.install(), "3.13.15")
+
+    def test_pinned_install_makes_no_api_call(self):
+        self.publish("3.12.14+20260924")
+        self.install("3.12.14+20260924")
+        self.assertEqual(self.net.api_calls(), [])
+
+    def test_already_installed_switches_without_downloading(self):
+        self.publish("3.12.13+20260801")
+        self.publish("3.12.14+20260924")
+        self.install("3.12.13+20260801")
+        self.install("3.12.14+20260924")
+        calls = len(self.net.calls)
+        self.install("3.12.13+20260801")
+        self.assertEqual(len(self.net.calls), calls)
+        self.assertEqual(self.pointer().default, "3.12.13")
+
+    def test_offline_restore_from_archive(self):
+        self.publish("3.12.13+20260801")
+        self.publish("3.12.14+20260924")
+        self.install("3.12.13+20260801")
+        self.install("3.12.14+20260924")
+        mp.cmd_remove("3.12.13", self.paths)
+        self.net.offline = True
+        self.install("3.12.13")
+        provenance = mp.read_provenance(self.paths.runtime_dir("3.12.13"))
+        self.assertTrue(provenance["source"].startswith("local archive ("))
+        self.assertEqual(provenance["build"], "20260801")
+
+    def test_tampered_archive_is_refused(self):
+        self.publish("3.12.13+20260801")
+        self.publish("3.12.14+20260924")
+        self.install("3.12.13+20260801")
+        self.install("3.12.14+20260924")
+        mp.cmd_remove("3.12.13", self.paths)
+        build = mp.Build("3.12.13", "20260801", TRIPLE)
+        tarball = self.paths.archive_entry("3.12.13", "20260801") / build.asset
+        tarball.write_bytes(tarball.read_bytes() + b"x")
+        with self.assertRaisesRegex(mp.ManagerError, "recorded checksum"):
+            self.install("3.12.13")
+        self.assertFalse(self.paths.runtime_dir("3.12.13").exists())
+
+    def assert_nothing_installed(self):
+        self.assertFalse(self.paths.runtime_dir("3.12.14").exists())
+        self.assertFalse(self.paths.archive_dir.exists())
+        self.assertFalse(self.paths.pointer_file.exists())
+        self.assertFalse(self.paths.bin_dir.exists())
+        self.assertEqual([e for e in self.share_entries() if e.startswith(".")], [])
+
+    def test_checksum_mismatch_installs_nothing(self):
+        self.publish("3.12.14+20260924", sums="00" * 32)
+        with self.assertRaisesRegex(mp.ManagerError, "checksum mismatch"):
+            self.install()
+        self.assert_nothing_installed()
+
+    def test_asset_missing_from_sums_installs_nothing(self):
+        self.publish("3.12.14+20260924")
+        self.net.files[mp.Build("3.12.14", "20260924", TRIPLE).sums_url] = b"ab  other.tar.gz\n"
+        with self.assertRaisesRegex(mp.ManagerError, "not listed in SHA256SUMS"):
+            self.install()
+        self.assert_nothing_installed()
+
+    def test_failed_health_check_installs_nothing(self):
+        self.publish("3.12.14+20260924", reports="3.11.0")
+        with self.assertRaisesRegex(mp.ManagerError, "health check"):
+            self.install()
+        self.assert_nothing_installed()
+
+    def test_unsafe_tarball_installs_nothing(self):
+        self.publish("3.12.14+20260924", extra={"../escaped": b"x"})
+        with self.assertRaisesRegex(mp.ManagerError, "unsafe|refusing"):
+            self.install()
+        self.assert_nothing_installed()
+        self.assertFalse((self.paths.share_dir.parent / "escaped").exists())
+
+    def test_legacy_member_checks(self):
+        destination = self.tmp / "dest"
+        destination.mkdir()
+        for name, kind, link in (("/abs", tarfile.REGTYPE, ""), ("a/../../b", tarfile.REGTYPE, ""),
+                                 ("dev", tarfile.CHRTYPE, ""), ("l", tarfile.SYMTYPE, "../../etc"),
+                                 ("l2", tarfile.SYMTYPE, "/etc/passwd")):
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = kind, link
+            with self.subTest(name=name), self.assertRaises(mp.ManagerError):
+                mp._check_member(info, destination)
+        ok = tarfile.TarInfo("python/bin/python3")
+        ok.type, ok.linkname = tarfile.SYMTYPE, "python3.12"
+        mp._check_member(ok, destination)
+
+    def test_foreign_alias_stops_before_any_network_access(self):
+        self.publish("3.12.14+20260924")
+        self.paths.bin_dir.mkdir(parents=True)
+        (self.paths.bin_dir / "python").write_text("#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n")
+        with self.assertRaisesRegex(mp.ManagerError, "--alias python=<new-name>"):
+            self.install()
+        self.assertEqual(self.net.calls, [])
+
+    def test_rename_before_install_avoids_a_collision(self):
+        self.publish("3.12.14+20260924")
+        self.paths.bin_dir.mkdir(parents=True)
+        uv = self.paths.bin_dir / "python3.12"
+        uv.write_text("#!/bin/sh\nexec uv-python \"$@\"\n")
+        mp.cmd_alias("python3.12=py312", self.paths)
+        self.install()
+        self.assertEqual(uv.read_text(), "#!/bin/sh\nexec uv-python \"$@\"\n")
+        self.assertEqual(mp.alias_owner(self.paths.bin_dir / "py312"), "ours")
+
+    def test_later_install_keeps_the_manager_version(self):
+        self.publish("3.12.14+20260924")
+        self.publish("3.13.15+20260924")
+        self.install()
+        self.make_source("0.4.0")
+        self.install("3.13")
+        self.assertEqual(self.pointer().self_version, "0.3.0")
+        self.assertEqual(os.listdir(self.paths.manager_dir), ["0.3.0"])
+        self.assertIn("Self-update is not yet available", self.err.getvalue())
+
+    def test_missing_manager_copy_is_reinstalled(self):
+        self.publish("3.12.14+20260924")
+        self.install()
+        shutil.rmtree(self.paths.manager_dir / "0.3.0")
+        self.install()
+        self.assertTrue((self.paths.manager_dir / "0.3.0" / "manage-python.py").is_file())
+
+    def test_manager_needs_a_version_file(self):
+        self.publish("3.12.14+20260924")
+        (self.source / "VERSION").unlink()
+        with self.assertRaisesRegex(mp.ManagerError, "does not hold a version"):
+            self.install()
+
+    def test_windows_layout(self):
+        paths = self.windows_paths()
+        self.publish("3.12.14+20260924", windows=True, triple="x86_64-pc-windows-msvc")
+        self.install(paths=paths, triple="x86_64-pc-windows-msvc")
+        runtime = paths.runtime_dir("3.12.14")
+        self.assertTrue((runtime / "python" / "Lib" / "EXTERNALLY-MANAGED").is_file())
+        self.assertTrue(all(p.is_file() for p in paths.pointer_files.values()))
+        self.assertEqual(sorted(os.listdir(paths.bin_dir)), [
+            "manage-python.cmd", "manage-python.ps1", "python.cmd", "python.ps1",
+            "python3.12.cmd", "python3.12.ps1"])
+
+    def test_path_notes(self):
+        self.env["PATH"] = "/usr/bin"
+        self.publish("3.12.14+20260924")
+        self.install()
+        self.assertIn("is not on your PATH", self.err.getvalue())
+
+
+# ── --switch ──────────────────────────────────────────────────────────────────
+
+class InstalledSet(Lifecycle):
+    """3.12.13, 3.12.14 and 3.13.15 installed, 3.12.14 the default."""
+
+    def setUp(self):
+        super().setUp()
+        for label in ("3.12.13+20260801", "3.12.14+20260924", "3.13.15+20260924"):
+            self.publish(label)
+        for label in ("3.12.13+20260801", "3.13.15+20260924", "3.12.14+20260924"):
+            self.install(label)
+
+
+class TestSwitch(InstalledSet):
+
+    def test_switch_within_a_line(self):
+        alias = (self.paths.bin_dir / "python3.12").read_bytes()
+        mp.cmd_switch("3.12.13", self.paths)
+        record = self.pointer()
+        self.assertEqual((record.default, record.lines),
+                         ("3.12.13", {"3.12": "3.12.13", "3.13": "3.13.15"}))
+        self.assertEqual(record.self_version, "0.3.0")
+        self.assertEqual((self.paths.bin_dir / "python3.12").read_bytes(), alias)
+
+    def test_switch_across_lines_moves_python(self):
+        mp.cmd_switch("3.13.15", self.paths)
+        self.assertIn("3.13\n  aliases     python3.13  python\n", self.status())
+
+    def test_keeps_renamed_aliases(self):
+        mp.cmd_alias("python3.12=py312", self.paths)
+        mp.cmd_switch("3.12.13", self.paths)
+        self.assertEqual(self.pointer().alias_name("3.12"), "py312")
+        self.assertFalse((self.paths.bin_dir / "python3.12").exists())
+
+    def test_restores_a_missing_alias(self):
+        (self.paths.bin_dir / "python").unlink()
+        mp.cmd_switch("3.12.14", self.paths)
+        self.assertEqual(mp.alias_owner(self.paths.bin_dir / "python"), "ours")
+
+    def test_refusals(self):
+        with self.assertRaisesRegex(mp.ManagerError, "--install 3.12.9"):
+            mp.cmd_switch("3.12.9", self.paths)
+        for bad in ("3.12", "0.3.0+1", "latest"):
+            with self.subTest(bad=bad), self.assertRaises(mp.UsageError):
+                mp.cmd_switch(bad, self.paths)
+
+
+# ── --remove ──────────────────────────────────────────────────────────────────
+
+class TestRemove(InstalledSet):
+
+    def test_removes_an_unaliased_version(self):
+        before = self.pointer()
+        mp.cmd_remove("3.12.13", self.paths)
+        self.assertFalse(self.paths.runtime_dir("3.12.13").exists())
+        self.assertEqual(self.pointer(), before)
+        self.assertIn("--install 3.12.13+20260801", self.err.getvalue())
+        self.assertIn("virtual environments created with 3.12.13", self.err.getvalue())
+        self.assertIn("    archived    3.12.13+20260801\n", self.status())
+        self.assertEqual([e for e in self.share_entries() if e.startswith(".")], [])
+
+    def test_refuses_the_default(self):
+        with self.assertRaisesRegex(mp.ManagerError, "default version"):
+            mp.cmd_remove("3.12.14", self.paths)
+        self.assertTrue(self.paths.runtime_dir("3.12.14").is_dir())
+
+    def test_refuses_a_line_version_while_others_remain(self):
+        mp.cmd_switch("3.12.13", self.paths)
+        mp.cmd_switch("3.13.15", self.paths)
+        with self.assertRaisesRegex(mp.ManagerError, "--switch 3.12.14"):
+            mp.cmd_remove("3.12.13", self.paths)
+
+    def test_last_version_of_a_line_takes_its_alias(self):
+        mp.cmd_alias("python3.13=py313", self.paths)
+        mp.cmd_remove("3.13.15", self.paths)
+        record = self.pointer()
+        self.assertNotIn("3.13", record.lines)
+        self.assertEqual(record.aliases.get("3.13"), "py313")
+        self.assertFalse((self.paths.bin_dir / "py313").exists())
+        self.publish("3.13.16+20261001")
+        self.install("3.13.16+20261001")
+        self.assertEqual(mp.alias_owner(self.paths.bin_dir / "py313"), "ours")
+
+    def test_refusals(self):
+        with self.assertRaisesRegex(mp.ManagerError, "not installed"):
+            mp.cmd_remove("3.12.9", self.paths)
+        with self.assertRaises(mp.UsageError):
+            mp.cmd_remove("3.12", self.paths)
+
+
+# ── --alias ───────────────────────────────────────────────────────────────────
+
+class TestAliasCommand(InstalledSet):
+
+    def test_rename_a_versioned_alias(self):
+        mp.cmd_alias("python3.12=py312", self.paths)
+        self.assertEqual(self.pointer().aliases["3.12"], "py312")
+        self.assertFalse((self.paths.bin_dir / "python3.12").exists())
+        self.assertIn("PYTHON_MANAGER_3_12", (self.paths.bin_dir / "py312").read_text())
+        self.assertIn("  aliases     py312  python\n", self.status())
+        mp.cmd_alias("py312=python3.12", self.paths)
+        self.assertTrue((self.paths.bin_dir / "python3.12").exists())
+        self.assertFalse((self.paths.bin_dir / "py312").exists())
+
+    def test_rename_python_and_the_manager(self):
+        mp.cmd_alias("python=py", self.paths)
+        mp.cmd_alias("manage-python=mp", self.paths)
+        self.assertIn("PYTHON_MANAGER_DEFAULT", (self.paths.bin_dir / "py").read_text())
+        self.assertIn("PYTHON_MANAGER_SELF", (self.paths.bin_dir / "mp").read_text())
+        self.assertFalse((self.paths.bin_dir / "manage-python").exists())
+
+    def test_refuses_a_foreign_file(self):
+        (self.paths.bin_dir / "py312").write_text("someone else's\n")
+        before = self.pointer()
+        with self.assertRaisesRegex(mp.ManagerError, "not written by manage-python"):
+            mp.cmd_alias("python3.12=py312", self.paths)
+        self.assertEqual(self.pointer(), before)
+        self.assertTrue((self.paths.bin_dir / "python3.12").exists())
+
+    def test_refuses_a_name_another_alias_uses(self):
+        with self.assertRaisesRegex(mp.ManagerError, "used twice"):
+            mp.cmd_alias("python3.12=python3.13", self.paths)
+
+    def test_leaves_a_foreign_old_file_in_place(self):
+        (self.paths.bin_dir / "python3.12").write_text("replaced by hand\n")
+        mp.cmd_alias("python3.12=py312", self.paths)
+        self.assertEqual((self.paths.bin_dir / "python3.12").read_text(), "replaced by hand\n")
+        self.assertIn("left in place", self.err.getvalue())
+
+    def test_refusals(self):
+        with self.assertRaisesRegex(mp.ManagerError, "no alias named"):
+            mp.cmd_alias("pip=p", self.paths)
+        for spec in ("python", "=py", "python=", "python3.12=../x"):
+            with self.subTest(spec=spec), self.assertRaises(mp.ManagerError):
+                mp.cmd_alias(spec, self.paths)
+        with self.assertRaises(mp.UsageError):
+            mp.cmd_alias("python", self.paths)
+
+    def test_same_name_is_a_no_op(self):
+        before = self.pointer()
+        mp.cmd_alias("python=python", self.paths)
+        self.assertEqual(self.pointer(), before)
+
+
+# ── main, exit codes and the operator log ─────────────────────────────────────
+
+class TestMainLifecycle(InstalledSet):
+
+    def run_main(self, *argv):
+        with mock.patch.object(mp, "Paths", return_value=self.paths), \
+             mock.patch.object(mp, "Network", return_value=self.net), \
+             mock.patch.object(mp, "detect_triple", return_value=TRIPLE):
+            return mp.main(list(argv))
+
+    def log_lines(self):
+        return self.paths.log_file.read_text().splitlines()
+
+    def test_exit_codes_and_log(self):
+        self.assertEqual(self.run_main("--switch", "3.12.13"), 0)
+        self.assertEqual(self.run_main("--switch", "3.12"), 2)
+        self.assertEqual(self.run_main("--remove", "3.12.9"), 1)
+        self.assertEqual(self.run_main("--alias", "python=py"), 0)
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 3)             # the usage error is not logged
+        self.assertRegex(lines[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ switch 3\.12\.13 ok$")
+        self.assertRegex(lines[1], r" remove 3\.12\.9 failed: 3\.12\.9 is not installed$")
+        self.assertRegex(lines[2], r" alias py ok$")
+
+    def test_install_through_main(self):
+        self.publish("3.13.16+20261001")
+        self.assertEqual(self.run_main("--install", "3.13.16+20261001"), 0)
+        self.assertRegex(self.log_lines()[-1], r" install 3\.13\.16 ok$")
+
+    @POSIX_ONLY
+    def test_refuses_root(self):
+        with mock.patch.object(mp.os, "geteuid", return_value=0):
+            self.assertEqual(self.run_main("--switch", "3.12.13"), 1)
+        self.assertIn("sudo", self.err.getvalue())
+        self.assertEqual(self.pointer().default, "3.12.14")
+
+    def test_status_is_read_only(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_main("--status"), 0)
+        self.assertFalse(self.paths.log_file.exists())
 
 
 if __name__ == "__main__":

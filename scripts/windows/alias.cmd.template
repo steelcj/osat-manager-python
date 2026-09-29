@@ -14,4 +14,9 @@ rem calling shell, and the runtime's exit code is the alias's exit code.
 setlocal
 call "%LOCALAPPDATA%\python-manager\python-manager.env.cmd"
 if exist "%APPDATA%\python-manager\env.cmd" call "%APPDATA%\python-manager\env.cmd"
+if not defined @VERSION_KEY@ goto :unset
 "%LOCALAPPDATA%\python-manager\%@VERSION_KEY@%\python\python.exe" %*
+exit /b %ERRORLEVEL%
+:unset
+echo @VERSION_KEY@ is not set in python-manager.env.cmd 1>&2
+exit /b 1

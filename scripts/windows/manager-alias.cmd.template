@@ -1,0 +1,23 @@
+@echo off
+rem
+rem source
+rem   project: osat-manager-python
+rem   path: scripts/windows/manager-alias.cmd.template
+rem generates
+rem   path: @ALIAS_PATH@
+rem
+rem Do not edit generated aliases; regenerated on --install, --switch and --alias.
+rem Calls the manager pointer, then the operator environment (owned by the
+rem operator, never touched by the manager), then runs the manager version
+rem the pointer names on the default runtime. setlocal keeps the pointer's
+rem variables out of the calling shell.
+setlocal
+call "%LOCALAPPDATA%\python-manager\python-manager.env.cmd"
+if exist "%APPDATA%\python-manager\env.cmd" call "%APPDATA%\python-manager\env.cmd"
+if not defined PYTHON_MANAGER_DEFAULT goto :unset
+if not defined PYTHON_MANAGER_SELF goto :unset
+"%LOCALAPPDATA%\python-manager\%PYTHON_MANAGER_DEFAULT%\python\python.exe" "%LOCALAPPDATA%\python-manager\manage-python\%PYTHON_MANAGER_SELF%\manage-python.py" %*
+exit /b %ERRORLEVEL%
+:unset
+echo PYTHON_MANAGER_DEFAULT and PYTHON_MANAGER_SELF must be set in python-manager.env.cmd 1>&2
+exit /b 1

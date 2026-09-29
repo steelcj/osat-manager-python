@@ -1,24 +1,25 @@
 #
 # source
 #   project: osat-manager-python
-#   path: scripts/windows/alias.ps1.template
+#   path: scripts/windows/manager-alias.ps1.template
 # generates
 #   path: @ALIAS_PATH@
 #
 # Do not edit generated aliases; regenerated on --install, --switch and --alias.
 # Sources the manager pointer, then the operator environment (owned by the
-# operator, never touched by the manager), then runs the runtime the pointer
-# names. $env: changes outlive a script, so the environment is snapshotted
-# first and restored afterwards, leaving the calling session as it was, and
-# the alias exits with the runtime's exit code.
+# operator, never touched by the manager), then runs the manager version the
+# pointer names on the default runtime. $env: changes outlive a script, so
+# the environment is snapshotted first and restored afterwards, and the
+# alias exits with the manager's exit code.
 $osatSnapshot = @{}
 foreach ($osatVar in @(Get-ChildItem Env:)) { $osatSnapshot[$osatVar.Name] = $osatVar.Value }
 $osatExit = 1
 try {
     . "$env:LOCALAPPDATA\python-manager\python-manager.env.ps1"
     if (Test-Path "$env:APPDATA\python-manager\env.ps1") { . "$env:APPDATA\python-manager\env.ps1" }
-    if (-not $env:@VERSION_KEY@) { throw "@VERSION_KEY@ is not set in python-manager.env.ps1" }
-    & "$env:LOCALAPPDATA\python-manager\$env:@VERSION_KEY@\python\python.exe" @args
+    if (-not $env:PYTHON_MANAGER_DEFAULT) { throw "PYTHON_MANAGER_DEFAULT is not set in python-manager.env.ps1" }
+    if (-not $env:PYTHON_MANAGER_SELF) { throw "PYTHON_MANAGER_SELF is not set in python-manager.env.ps1" }
+    & "$env:LOCALAPPDATA\python-manager\$env:PYTHON_MANAGER_DEFAULT\python\python.exe" "$env:LOCALAPPDATA\python-manager\manage-python\$env:PYTHON_MANAGER_SELF\manage-python.py" @args
     $osatExit = $LASTEXITCODE
 }
 finally {
