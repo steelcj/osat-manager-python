@@ -7,6 +7,8 @@ N` file and the git tags. Dates are ISO 8601.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-29
+
 ### Added
 
 - `manage-python.py`, the 0.3.0 reference implementation of the layout and lifecycle proposal, starting with the parts that need no downloads: the pointer file and alias record in POSIX, `.cmd` and `.ps1` syntax with atomic writes; `PROVENANCE` read and write, sharing restic-tool's first five keys; platform triple selection with Rosetta and musl detection; `--status` built from the filesystem; and alias rendering with the `by:` ownership check. Then `--install`, `--switch`, `--remove` and `--alias`: archive-first installs verified against SHA256SUMS, health-checked in a staging directory, protected with `EXTERNALLY-MANAGED` and archived; the manager installs itself under `manage-python/<version>/` and is reached through its own alias; each lifecycle action is logged to `manage-python.log`.
