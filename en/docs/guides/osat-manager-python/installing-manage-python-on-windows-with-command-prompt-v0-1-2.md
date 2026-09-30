@@ -170,7 +170,7 @@ Windows only gives the new PATH to windows opened after the change. Close this C
 
 ## Check that it works
 
-In the new window:
+**In the new cmd window:**
 
 ```bat
 where.exe python
@@ -231,6 +231,7 @@ Your 3.13 version number may be newer than 3.13.15.
 To make `python` run 3.14 again, switch to its full version number:
 
 ```bat
+python --version
 manage-python --switch 3.14.7
 python --version
 ```

@@ -91,6 +91,7 @@ SANDBOX_VAR          = "PYTHON_MANAGER_SANDBOX"
 POSIX_SANDBOX_VARS   = ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_BIN_HOME")
 WINDOWS_SANDBOX_VARS = ("LOCALAPPDATA", "APPDATA")
 
+POSIX_MODES = os.name != "nt"     # whether permission bits mean anything on this machine
 DIR_MODE  = 0o700
 FILE_MODE = 0o600
 EXEC_MODE = 0o700
@@ -207,32 +208,71 @@ def sandbox_mode() -> bool:
     return bool(os.environ.get(SANDBOX_VAR))
 
 
+CSIDL_APPDATA, CSIDL_LOCAL_APPDATA, CSIDL_PROFILE = 0x001A, 0x001C, 0x0028
+
+
+def _windows_folder(csidl: int) -> Optional[Path]:
+    """A Windows shell folder from the user's profile, not from %LOCALAPPDATA%
+    or %APPDATA%, which a sandbox overrides."""
+    try:
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buffer) == 0:  # type: ignore[attr-defined]
+            return Path(buffer.value)
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
 def real_home() -> Path:
     """The account's home directory from the system, never from $HOME, which
     a sandbox overrides."""
     if os.name == "nt":
-        return Path(os.environ.get("USERPROFILE") or Path.home())
+        return _windows_folder(CSIDL_PROFILE) or Path(os.environ.get("USERPROFILE") or Path.home())
     import pwd
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
+def protected_locations() -> List[Path]:
+    """The real locations the manager writes to outside sandbox mode,
+    resolved from the system rather than from the environment. On Linux and
+    macOS these are the default XDG locations under the real home, so an
+    account's own XDG overrides are not known here."""
+    if os.name == "nt":
+        local = _windows_folder(CSIDL_LOCAL_APPDATA) or real_home() / "AppData" / "Local"
+        roaming = _windows_folder(CSIDL_APPDATA) or real_home() / "AppData" / "Roaming"
+        return [local / MANAGER_ID, local / "Programs", roaming / MANAGER_ID]
+    home = real_home()
+    return [home / ".local" / "share" / MANAGER_ID, home / ".config" / MANAGER_ID,
+            home / ".local" / "state" / MANAGER_ID, home / ".local" / "bin"]
+
+
 def _inside(path: Path, root: Path) -> bool:
-    target = os.path.realpath(str(path))
-    base = os.path.realpath(str(root))
+    """True if `path` is `root` or below it, after resolving symbolic links;
+    case-insensitive where the platform's paths are."""
+    target = os.path.normcase(os.path.realpath(str(path)))
+    base = os.path.normcase(os.path.realpath(str(root)))
     return target == base or target.startswith(base.rstrip(os.sep) + os.sep)
 
 
-def guard_path(path: Path) -> None:
-    """In sandbox mode, refuse to write anywhere inside the real home."""
-    if sandbox_mode() and _inside(path, real_home()):
-        raise ManagerError(_("sandbox mode: refusing to write {path}, which is inside your real "
-                             "home directory {home}").format(path=path, home=real_home()))
+def guard_path(path: Path, removing: bool = False) -> None:
+    """In sandbox mode, refuse to write inside a real location the manager
+    uses, or, when removing a tree, to remove one that contains such a
+    location. Anywhere else, a scratch home inside the real home included,
+    is allowed."""
+    if not sandbox_mode():
+        return
+    for location in protected_locations():
+        if _inside(path, location) or (removing and _inside(location, path)):
+            raise ManagerError(_("sandbox mode: refusing to change {path}, which would change "
+                                 "{location}, where the manager writes outside sandbox mode")
+                               .format(path=path, location=location))
 
 
 def check_sandbox(paths: "Paths") -> None:
     """In sandbox mode, refuse a changing command unless HOME and the XDG
-    variables (LOCALAPPDATA and APPDATA for Windows) are all set and none of
-    them, or any location derived from them, is inside the real home."""
+    variables (LOCALAPPDATA and APPDATA for Windows) are all set, and every
+    location derived from them is outside the manager's real locations."""
     if not sandbox_mode():
         return
     names = WINDOWS_SANDBOX_VARS if paths.windows else POSIX_SANDBOX_VARS
@@ -240,8 +280,8 @@ def check_sandbox(paths: "Paths") -> None:
     if missing:
         raise ManagerError(_("sandbox mode: {names} must be set to a scratch directory")
                            .format(names=", ".join(missing)))
-    for location in [Path(paths.environ[name]) for name in names] + [
-            paths.share_dir, paths.bin_dir, paths.pointer_dir, paths.config_dir, paths.state_dir]:
+    for location in (paths.share_dir, paths.archive_dir, paths.manager_dir, paths.bin_dir,
+                     paths.pointer_dir, paths.config_dir, paths.state_dir):
         guard_path(location)
 
 
@@ -399,7 +439,7 @@ def ensure_dir(path: Path, windows: bool) -> None:
     guard_path(path)
     created = not path.exists()
     path.mkdir(parents=True, exist_ok=True)
-    if windows:
+    if windows or not POSIX_MODES:
         return
     if created:
         path.chmod(DIR_MODE)
@@ -425,7 +465,7 @@ def atomic_write_text(path: Path, text: str, *, newline: str = "\n",
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        if not windows:
+        if not windows and POSIX_MODES:
             os.chmod(tmp_name, mode)
         os.replace(tmp_name, str(path))
     except BaseException:
@@ -460,7 +500,7 @@ def make_temp_dir(parent: Path, prefix: str) -> Path:
 
 def remove_tree(path: Path) -> None:
     """Remove a manager-owned tree, clearing read-only flags Windows sets."""
-    guard_path(path)
+    guard_path(path, removing=True)
     def retry(function, target, _info):
         os.chmod(target, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
         function(target)
@@ -1449,7 +1489,7 @@ def install_runtime(build: Build, tarball: Path, sha256: str, source: str,
         write_provenance(staging, asset=build.asset, sha256=sha256, source=source,
                          version=build.version, build=build.build, triple=build.triple,
                          now=now, windows=paths.windows, manager=manager)
-        if not paths.windows:
+        if not paths.windows and POSIX_MODES:
             make_owner_only(staging)
         os.rename(str(staging), str(paths.runtime_dir(build.version)))
     except BaseException:
@@ -1470,7 +1510,7 @@ def archive_tarball(build: Build, tarball: Path, sha256: str, source: str,
         write_provenance(staging, asset=build.asset, sha256=sha256, source=source,
                          version=build.version, build=build.build, triple=build.triple,
                          now=now, windows=paths.windows, manager=manager)
-        if not paths.windows:
+        if not paths.windows and POSIX_MODES:
             make_owner_only(staging)
         if entry.exists():
             remove_tree(entry)
@@ -1513,7 +1553,7 @@ def install_self(paths: Paths, source_dir: Path = _HERE,
         write_provenance(staging, asset=SCRIPT_NAME, sha256=sha256_of(script),
                          source=f"local copy ({paths.display(script)})", now=now,
                          windows=paths.windows, manager=version)
-        if not paths.windows:
+        if not paths.windows and POSIX_MODES:
             make_owner_only(staging)
         os.rename(str(staging), str(target))
     except BaseException:
@@ -1537,7 +1577,7 @@ def append_log(paths: Paths, action: str, target: str, result: str,
                          " ".join(result.split())])
         with open(paths.log_file, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
-        if not paths.windows:
+        if not paths.windows and POSIX_MODES:
             paths.log_file.chmod(FILE_MODE)
     except (OSError, ManagerError) as error:
         log(_("warning: could not write {path}: {error}")

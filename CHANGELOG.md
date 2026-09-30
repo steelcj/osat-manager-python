@@ -13,6 +13,12 @@ N` file and the git tags. Dates are ISO 8601.
 
 - Release archives no longer contain `.claude/` (session logs and assistant notes). They were in the 1.0.0 and 1.0.2 archives because those files were tracked, and `git archive`, which `publish-release.py` uses, packages every tracked file; `.gitignore` does not affect files that are already tracked. `.claude/` is no longer tracked (the files stay on disk; the root `CLAUDE.md` stays tracked), and `publish-release.py` now refuses to package a tag in which any tracked file matches `.gitignore`, naming the files, with a test in `test_publish_release.py`.
 
+- On Windows the test suite failed (11 failures, 50 errors): the temporary directory, `%LOCALAPPDATA%\Temp`, is inside the user's home, and sandbox mode refused anything inside the real home, the suite's own scratch home included. Sandbox mode now refuses only the real locations the manager writes to outside sandbox mode, resolved from the system: on Windows `%LOCALAPPDATA%\python-manager`, `%LOCALAPPDATA%\Programs` and `%APPDATA%\python-manager` (and never the registry), on Linux and macOS `~/.local/share/python-manager`, `~/.config/python-manager`, `~/.local/state/python-manager` and `~/.local/bin`. Removing a tree that contains one of them is refused too. Found on the Windows 11 VM.
+
+- Permission checks now follow the machine rather than the layout in use, so an existing directory is no longer refused as broader than owner-only on Windows, where every directory reports mode 0o777.
+
+- The test suite runs on Windows: path separators, file encodings and symbolic links are handled portably, and on Windows the install tests read the version their stand-in interpreter scripts would print, since Windows cannot run them.
+
 ### Added
 
 - The plain-language guide *Installing manage-python on Windows with Command Prompt*, version 0.1.2, in `en/docs/guides/osat-manager-python/`.

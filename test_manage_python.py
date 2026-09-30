@@ -59,6 +59,11 @@ _spec.loader.exec_module(mp)
 
 POSIX_ONLY = unittest.skipIf(os.name == "nt", "exercises POSIX modes and /bin/sh")
 
+
+def tilde(*parts):
+    """A path under ~ as Paths.display shows it on this platform."""
+    return "~" + os.sep + os.path.join(*parts)
+
 # The pointer as the proposal's pointer file section shows it.
 PROPOSAL_POINTER = '''PYTHON_MANAGER_DEFAULT="3.12.14"
 PYTHON_MANAGER_3_12="3.12.14"
@@ -144,10 +149,10 @@ class TestPaths(Scratch):
 
     def test_display(self):
         self.assertEqual(self.posix_paths().display(self.home / ".local/bin/python3.12"),
-                         "~/.local/bin/python3.12")
+                         tilde(".local", "bin", "python3.12"))
         paths = self.windows_paths()
         self.assertTrue(paths.display(paths.bin_dir / "python.cmd").startswith("%LOCALAPPDATA%"))
-        self.assertEqual(paths.display(Path("/elsewhere")), "/elsewhere")
+        self.assertEqual(paths.display(Path("/elsewhere")), str(Path("/elsewhere")))
 
 
 # ── Pointer file and alias record ─────────────────────────────────────────────
@@ -247,7 +252,7 @@ class TestPointerFormats(Scratch):
         text = mp.render_pointer(self.record(), "posix", self.posix_paths())
         body = "".join(l + "\n" for l in text.splitlines() if not l.startswith("#"))
         self.assertEqual(body, PROPOSAL_POINTER)
-        self.assertIn("# ~/.config/python-manager/python-manager.env\n", text)
+        self.assertIn("# " + tilde(".config", "python-manager", "python-manager.env") + "\n", text)
         self.assertIn("never touches", text)
 
     def test_cmd_and_ps1_syntax(self):
@@ -405,7 +410,7 @@ class TestProvenance(Scratch):
     def test_manager_provenance_has_first_five_keys_only(self):
         path = mp.write_provenance(self.tmp, asset="osat-manager-python-0.3.0.tar.gz",
                                    sha256="ab" * 32, source="local archive (/x)", now=self.NOW)
-        keys = [line.split(":", 1)[0] for line in path.read_text().splitlines()]
+        keys = [line.split(":", 1)[0] for line in path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(tuple(keys), mp.PROVENANCE_KEYS)
 
     def test_first_five_keys_match_restic_order(self):
@@ -779,7 +784,7 @@ class TestAliasRendering(Scratch):
             "#   project: osat-manager-python\n"
             "#   path: scripts/nix/alias.template\n"
             "# generated\n"
-            "#   path: ~/.local/bin/python3.12\n"
+            "#   path: " + tilde(".local", "bin", "python3.12") + "\n"
             "#   by: manage-python.py\n"
             "#\n"
             "# Do not edit generated aliases; regenerated on --install, --switch and --alias.\n"))
@@ -1136,6 +1141,22 @@ def runtime_tarball(path, version, reports=None, windows=False, extra=None):
     return path.read_bytes()
 
 
+def simulated_health_check(interpreter, version):
+    """Windows cannot run the stand-in interpreter scripts, so on Windows the
+    tests read the version the script would print instead. The real
+    health_check runs everywhere else."""
+    import re
+    try:
+        text = Path(interpreter).read_text(encoding="utf-8")
+    except OSError as error:
+        raise mp.ManagerError(f"the runtime did not start: {error}")
+    match = re.search(r'echo "([^"]*)"', text)
+    reported = match.group(1) if match else ""
+    if reported != version:
+        raise mp.ManagerError(f"the runtime failed its health check: expected {version}, "
+                              f"got {reported!r}")
+
+
 class FakeNetwork:
     """Serves releases, SHA256SUMS and tarballs from memory and records every URL."""
 
@@ -1201,6 +1222,10 @@ class Lifecycle(Scratch):
         patcher = redirect_stderr(self.err)
         patcher.__enter__()
         self.addCleanup(patcher.__exit__, None, None, None)
+        if os.name == "nt":
+            health = mock.patch.object(mp, "health_check", simulated_health_check)
+            health.start()
+            self.addCleanup(health.stop)
 
     def make_source(self, version):
         """A downloaded manager release: the script, VERSION and templates."""
@@ -1715,29 +1740,36 @@ class TestMainLifecycle(InstalledSet):
 # ── Sandbox isolation ─────────────────────────────────────────────────────────
 
 class TestSandbox(Lifecycle):
-    """A fake real home stands in for the account's home directory, so every
-    refusal can be checked without going near the real one."""
+    """Sandbox mode refuses the manager's real locations and nothing else.
+    Stand-ins for those locations under a fake real home let every refusal
+    be checked, on any platform, without going near the real ones."""
 
     def setUp(self):
         super().setUp()
+        self.real_protected = mp.protected_locations            # before patching
         self.fake_home = self.tmp / "realhome"
-        patcher = mock.patch.object(mp, "real_home", return_value=self.fake_home)
+        home = self.fake_home
+        self.protected = [home / ".local" / "share" / "python-manager",
+                          home / ".config" / "python-manager",
+                          home / ".local" / "state" / "python-manager", home / ".local" / "bin"]
+        patcher = mock.patch.object(mp, "protected_locations", side_effect=lambda: list(self.protected))
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def home_env(self):
-        home = self.fake_home
-        return {"HOME": str(home), "XDG_DATA_HOME": str(home / ".local/share"),
+    def home_env(self, home=None):
+        home = home or self.fake_home
+        return {"HOME": str(home), "XDG_DATA_HOME": str(home / ".local" / "share"),
                 "XDG_CONFIG_HOME": str(home / ".config"),
-                "XDG_STATE_HOME": str(home / ".local/state"),
-                "XDG_BIN_HOME": str(home / ".local/bin")}
+                "XDG_STATE_HOME": str(home / ".local" / "state"),
+                "XDG_BIN_HOME": str(home / ".local" / "bin")}
 
-    def test_this_module_runs_in_a_scratch_home(self):
-        real = Path(__import__("pwd").getpwuid(os.getuid()).pw_dir) if os.name != "nt" \
-            else Path(os.environ.get("USERPROFILE", ""))
+    def test_this_module_runs_outside_the_real_locations(self):
         self.assertTrue(mp.sandbox_mode())
-        for name in mp.POSIX_SANDBOX_VARS + mp.WINDOWS_SANDBOX_VARS:
-            self.assertFalse(mp._inside(Path(os.environ[name]), real), name)
+        default = mp.Paths(windows=os.name == "nt")            # this module's environment
+        for location in (default.share_dir, default.bin_dir, default.pointer_dir,
+                         default.config_dir, default.state_dir):
+            for real in self.real_protected():
+                self.assertFalse(mp._inside(location, real), (location, real))
 
     def test_refuses_missing_variables(self):
         paths = mp.Paths(windows=False, environ={"HOME": str(self.tmp)}, home=self.tmp)
@@ -1747,7 +1779,7 @@ class TestSandbox(Lifecycle):
         with self.assertRaisesRegex(mp.ManagerError, "APPDATA must be set"):
             mp.check_sandbox(paths)
 
-    def test_refuses_locations_in_the_real_home(self):
+    def test_refuses_the_real_locations(self):
         paths = mp.Paths(windows=False, environ=self.home_env(), home=self.fake_home)
         for command in (lambda: mp.cmd_switch("3.12.14", paths),
                         lambda: mp.cmd_remove("3.12.14", paths),
@@ -1760,24 +1792,52 @@ class TestSandbox(Lifecycle):
         self.assertEqual(self.net.calls, [])
 
     def test_one_stray_variable_is_enough(self):
-        env = dict(self.env, XDG_STATE_HOME=str(self.fake_home / ".local/state"))
+        env = dict(self.env, XDG_STATE_HOME=str(self.fake_home / ".local" / "state"))
         paths = mp.Paths(windows=False, environ=env, home=self.home)
         with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
             mp.cmd_alias("python=py", paths)
 
-    def test_write_primitives_refuse_the_real_home(self):
-        target = self.fake_home / "x"
-        for write in (lambda: mp.atomic_write_text(target, "x"),
-                      lambda: mp.ensure_dir(target, False),
-                      lambda: mp.make_temp_dir(self.fake_home, ".t-"),
-                      lambda: mp.remove_tree(target)):
-            with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
-                write()
+    def test_write_primitives_refuse_the_real_locations(self):
+        for location in self.protected:
+            for write in (lambda: mp.atomic_write_text(location / "x", "x"),
+                          lambda: mp.ensure_dir(location / "d", False),
+                          lambda: mp.make_temp_dir(location, ".t-"),
+                          lambda: mp.remove_tree(location)):
+                with self.subTest(location=location), \
+                        self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+                    write()
+        with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+            mp.remove_tree(self.fake_home / ".local")           # it contains real locations
         self.assertFalse(self.fake_home.exists())
 
+    def test_a_scratch_home_inside_the_real_home_is_allowed(self):
+        """On Windows the temporary directory, %LOCALAPPDATA%\\Temp, is inside
+        the user's home: a scratch home there must work."""
+        scratch = self.fake_home / "AppData" / "Local" / "Temp" / "manage-python-test" / "home"
+        paths = mp.Paths(windows=False, environ=self.home_env(scratch), home=scratch)
+        self.assertEqual(mp.cmd_alias("python=py", paths), "py")
+        self.assertTrue(paths.pointer_file.is_file())
+        mp.atomic_write_text(self.fake_home / "notes.txt", "x")
+        mp.remove_tree(scratch)
+        self.assertFalse(any(location.exists() for location in self.protected))
+
+    def test_windows_real_locations(self):
+        local = self.fake_home / "AppData" / "Local"
+        roaming = self.fake_home / "AppData" / "Roaming"
+        self.protected = [local / "python-manager", local / "Programs", roaming / "python-manager"]
+        temp = local / "Temp" / "manage-python-test"
+        scratch = {"LOCALAPPDATA": str(temp / "local"), "APPDATA": str(temp / "roaming")}
+        paths = mp.Paths(windows=True, environ=scratch, home=self.home)
+        self.assertEqual(mp.cmd_alias("python=py", paths), "py")
+        for env in ({"LOCALAPPDATA": str(local), "APPDATA": str(temp / "roaming")},
+                    {"LOCALAPPDATA": str(temp / "local"), "APPDATA": str(roaming)}):
+            with self.subTest(env=env), self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
+                mp.cmd_alias("python=py2", mp.Paths(windows=True, environ=env, home=self.home))
+        self.assertFalse(any(location.exists() for location in self.protected))
+
     def test_the_stray_log_line_cannot_happen_again(self):
-        """Last session: a smoke run of a failing --switch wrote a log line
-        into the real ~/.local/state. The same run now writes nothing there."""
+        """A smoke run of a failing --switch once wrote a log line into the
+        real ~/.local/state. The same run now writes nothing there."""
         paths = mp.Paths(windows=False, environ=self.home_env(), home=self.fake_home)
         with mock.patch.object(mp, "Paths", return_value=paths):
             self.assertEqual(mp.main(["--switch", "3.12.14"]), 1)
@@ -1785,18 +1845,22 @@ class TestSandbox(Lifecycle):
         self.assertFalse(self.fake_home.exists())
         self.assertIn("sandbox mode", self.err.getvalue())
 
-    def test_symlink_into_the_real_home_is_refused(self):
-        self.fake_home.mkdir()
+    def test_symlink_into_a_real_location_is_refused(self):
+        config = self.protected[1]
+        config.mkdir(parents=True)
         link = self.tmp / "looks-like-scratch"
-        link.symlink_to(self.fake_home)
+        try:
+            link.symlink_to(config, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"cannot create symbolic links here: {error}")
         with self.assertRaisesRegex(mp.ManagerError, "sandbox mode"):
             mp.atomic_write_text(link / "pointer", "x")
-        self.assertEqual(os.listdir(self.fake_home), [])
+        self.assertEqual(os.listdir(config), [])
 
     def test_inactive_outside_sandbox_mode(self):
         with mock.patch.dict(os.environ, {"PYTHON_MANAGER_SANDBOX": ""}):
             self.assertFalse(mp.sandbox_mode())
-            mp.guard_path(self.fake_home / "x")
+            mp.guard_path(self.protected[0] / "x")
             mp.check_sandbox(mp.Paths(windows=False, environ={}, home=self.fake_home))
 
     def test_windows_registry_is_never_touched_in_sandbox_mode(self):
@@ -1804,6 +1868,18 @@ class TestSandbox(Lifecycle):
             def __getattr__(self, name):
                 raise AssertionError("registry used in sandbox mode")
         self.assertFalse(mp.add_to_windows_user_path(self.windows_paths(), registry=Untouchable()))
+
+    def test_protected_locations_on_this_platform(self):
+        names = [str(location) for location in self.real_protected()]
+        if os.name == "nt":
+            self.assertEqual(len(names), 3)
+            self.assertTrue(names[0].endswith("python-manager") and names[1].endswith("Programs"))
+        else:
+            home = str(mp.real_home())
+            self.assertEqual(names, [os.path.join(home, ".local", "share", "python-manager"),
+                                     os.path.join(home, ".config", "python-manager"),
+                                     os.path.join(home, ".local", "state", "python-manager"),
+                                     os.path.join(home, ".local", "bin")])
 
 
 # ── Release selection: pre-release and free-threaded builds ───────────────────
@@ -2274,7 +2350,7 @@ class TestPowerShellScriptsNeedNoModulePath(unittest.TestCase):
 
     def cmdlets(self, path):
         import re
-        code = "\n".join(line.split(" #")[0] for line in path.read_text().splitlines()
+        code = "\n".join(line.split(" #")[0] for line in path.read_text(encoding="utf-8").splitlines()
                          if not line.lstrip().startswith("#"))
         own = set(re.findall(r"^\s*function\s+([A-Za-z]+-[A-Za-z0-9]+)", code, re.M))
         used = set(re.findall(r"(?<![\w$.-])([A-Z][a-z]+-[A-Z][A-Za-z0-9]+)\b", code))
@@ -2291,7 +2367,7 @@ class TestPowerShellScriptsNeedNoModulePath(unittest.TestCase):
                 self.assertEqual(sorted(self.cmdlets(path) & self.NEEDS_MODULE_PATH), [])
 
     def test_install_ps1_hashes_with_dotnet(self):
-        text = (_SCRIPT.parent / "install.ps1").read_text()
+        text = (_SCRIPT.parent / "install.ps1").read_text(encoding="utf-8")
         self.assertIn("[System.Security.Cryptography.SHA256]::Create()", text)
         self.assertIn("$actualHash = Get-Sha256Hex $ArchivePath", text)
 
@@ -2323,7 +2399,7 @@ class TestRepositoryTracksNothingIgnored(unittest.TestCase):
         self.assertIn("CLAUDE.md", self.git("ls-files", "--", "CLAUDE.md").split())
 
     def test_publish_release_checks_before_building(self):
-        text = (_SCRIPT.parent / "publish-release.py").read_text()
+        text = (_SCRIPT.parent / "publish-release.py").read_text(encoding="utf-8")
         self.assertLess(text.index("    refuse_if_ignored_files_tracked(tag)"),
                         text.index("    first = build_tarball(tag, repo, version)"))
 
