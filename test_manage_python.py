@@ -1074,40 +1074,115 @@ class TestManagerAlias(Scratch):
         self.assertIn("PYTHON_MANAGER_SELF", result.stderr)
 
 
+def real_runtime(root):
+    """A runtime directory whose python.exe really starts.
+
+    Rule for every test that launches a runtime: on Windows, never a stand-in
+    script named .exe. Windows cannot run one, and may show an "Unsupported
+    16-Bit Application" dialog. On Windows this copies the running
+    interpreter's python.exe and its DLLs, and returns the PYTHONHOME that
+    points the copy at the running interpreter's standard library. Elsewhere
+    a script that runs the current interpreter serves, since POSIX runs
+    scripts whatever their name. Returns (python.exe path, PYTHONHOME or None)."""
+    exe = root / "python" / "python.exe"
+    exe.parent.mkdir(parents=True)
+    if os.name != "nt":
+        exe.write_text('#!/bin/sh\nexec "{}" "$@"\n'.format(sys.executable))
+        exe.chmod(0o700)
+        return exe, None
+    base = Path(sys.base_prefix)
+    source = base / "python.exe"
+    if not source.is_file():
+        raise unittest.SkipTest(f"no python.exe in {base} to copy")
+    try:
+        shutil.copyfile(source, exe)
+        for dll in list(base.glob("python*.dll")) + list(base.glob("vcruntime*.dll")):
+            shutil.copyfile(dll, exe.parent / dll.name)
+    except OSError as error:                        # e.g. a Microsoft Store Python
+        raise unittest.SkipTest(f"cannot copy the running interpreter: {error}")
+    assert exe.read_bytes()[:2] == b"MZ", "a Windows test would launch a non-executable"
+    return exe, str(base)
+
+
 @unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed")
 class TestPowerShellAliasRestoresEnvironment(Scratch):
-    """The .ps1 alias must leave the calling session's environment as it was."""
+    """The .ps1 alias must leave the calling session's environment as it was,
+    whether the runtime exits 0, exits with an error code, or fails to start.
+    A start failure is tried twice: caught, and uncaught so PowerShell
+    formats the error, as in the first Windows run. Each case prints the
+    variables that differ, so a failure says what changed."""
 
-    def test_session_environment_unchanged(self):
+    CASES = ("ok", "seven", "missing_caught", "missing_uncaught")
+
+    def run_session(self):
         paths = self.windows_paths()
         local = self.home / "AppData" / "Local"
         roaming = self.home / "AppData" / "Roaming"
-        exe = paths.runtime_dir("3.12.14") / "python" / "python.exe"
-        exe.parent.mkdir(parents=True)
-        exe.write_text('#!/bin/sh\necho "runtime $*"\nexit 7\n')
-        exe.chmod(0o700)
+        exe, python_home = real_runtime(paths.runtime_dir("3.12.14"))
         mp.write_pointer(mp.PointerRecord(default="3.12.14", lines={"3.12": "3.12.14"}), paths)
         paths.config_dir.mkdir(parents=True)
+        # The operator environment changes one variable and adds one; for the
+        # start-failure cases it points the alias at a version that is not
+        # installed, so python.exe is missing.
         (paths.config_dir / "env.ps1").write_text(
-            '$env:OSAT_KEEP = "changed-by-operator"\n$env:OSAT_ADDED = "added-by-operator"\n')
+            '$env:OSAT_KEEP = "changed-by-operator"\n'
+            '$env:OSAT_ADDED = "added-by-operator"\n'
+            'if ($env:OSAT_CASE -like "missing*") { $env:PYTHON_MANAGER_3_12 = "3.12.99" }\n')
         [_cmd, ps1] = mp.write_alias(paths, "3.12", "python3.12")
-        session = f"""
+        home_line = f"$env:PYTHONHOME = '{python_home}'" if python_home else ""
+        session = self.tmp / "session.ps1"
+        session.write_text(f"""
 $env:LOCALAPPDATA = '{local}'
 $env:APPDATA = '{roaming}'
 $env:OSAT_KEEP = 'before'
+{home_line}
+$alias = '{ps1}'
 function Snap {{ (Get-ChildItem Env: | Sort-Object Name | ForEach-Object {{ "$($_.Name)=$($_.Value)" }}) -join "`n" }}
+function Report($case, $before) {{
+    $after = Snap
+    if ($before -ceq $after) {{ "ENV_$case=unchanged" }} else {{
+        "ENV_$case=changed"
+        Compare-Object ($before -split "`n") ($after -split "`n") |
+            ForEach-Object {{ "DIFF_$case $($_.SideIndicator) $($_.InputObject)" }}
+    }}
+}}
+
+$env:OSAT_CASE = 'ok'
 $before = Snap
-& '{ps1}' first second
-$code = $LASTEXITCODE
-$after = Snap
-if ($before -cne $after) {{ Write-Output "CHANGED"; exit 90 }}
-exit $code
-"""
-        result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", session],
-                                capture_output=True, text=True, timeout=120)
-        self.assertNotIn("CHANGED", result.stdout, result.stderr)
-        self.assertIn("runtime first second", result.stdout)
-        self.assertEqual(result.returncode, 7, result.stderr)
+& $alias -c "import sys; print('runtime', *sys.argv[1:])" first second
+"CODE_ok=$LASTEXITCODE"
+Report 'ok' $before
+
+$env:OSAT_CASE = 'seven'
+$before = Snap
+& $alias -c "import sys; sys.exit(7)"
+"CODE_seven=$LASTEXITCODE"
+Report 'seven' $before
+
+$env:OSAT_CASE = 'missing_caught'
+$before = Snap
+try {{ & $alias --version }} catch {{ "START_FAILED=$($_.Exception.GetType().Name)" }}
+Report 'missing_caught' $before
+
+$env:OSAT_CASE = 'missing_uncaught'
+$before = Snap
+& $alias --version
+Report 'missing_uncaught' $before
+""", encoding="utf-8")
+        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                               "-File", str(session)], capture_output=True, text=True, timeout=180)
+
+    def test_environment_is_restored_on_every_path(self):
+        result = self.run_session()
+        lines = result.stdout.splitlines()
+        detail = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        self.assertIn("runtime first second", lines, detail)
+        self.assertIn("CODE_ok=0", lines, detail)
+        self.assertIn("CODE_seven=7", lines, detail)
+        self.assertTrue(any(line.startswith("START_FAILED=") for line in lines), detail)
+        for case in self.CASES:
+            with self.subTest(case=case):
+                self.assertIn(f"ENV_{case}=unchanged", lines, detail)
 
 
 # ── Lifecycle fixtures ────────────────────────────────────────────────────────
@@ -1730,6 +1805,21 @@ class TestMainLifecycle(InstalledSet):
             self.assertEqual(self.run_main("--switch", "3.12.13"), 1)
         self.assertIn("sudo", self.err.getvalue())
         self.assertEqual(self.pointer().default, "3.12.14")
+
+    def test_refuses_administrator_on_windows(self):
+        """Runs on every platform: the Windows check with a stand-in for
+        shell32's IsUserAnAdmin."""
+        import types
+        for admin, refused in ((1, True), (0, False)):
+            shell32 = types.SimpleNamespace(IsUserAnAdmin=lambda admin=admin: admin)
+            fake = types.SimpleNamespace(windll=types.SimpleNamespace(shell32=shell32))
+            with self.subTest(admin=admin), mock.patch.dict(sys.modules, {"ctypes": fake}), \
+                    mock.patch.object(mp.os, "name", "nt"):
+                if refused:
+                    with self.assertRaisesRegex(mp.ManagerError, "Administrator"):
+                        mp.root_guard()
+                else:
+                    mp.root_guard()
 
     def test_status_is_read_only(self):
         with redirect_stdout(io.StringIO()):

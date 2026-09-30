@@ -22,14 +22,17 @@ try {
     $osatExit = $LASTEXITCODE
 }
 finally {
+    # The Env: provider, not [Environment]::SetEnvironmentVariable: PowerShell
+    # passes $null to a .NET string parameter as "", and whether "" deletes a
+    # variable is up to the .NET version underneath.
     foreach ($osatVar in @(Get-ChildItem Env:)) {
         if (-not $osatSnapshot.ContainsKey($osatVar.Name)) {
-            [Environment]::SetEnvironmentVariable($osatVar.Name, $null)
+            Remove-Item -LiteralPath "Env:$($osatVar.Name)" -ErrorAction SilentlyContinue
         }
     }
     foreach ($osatName in @($osatSnapshot.Keys)) {
         if ([Environment]::GetEnvironmentVariable($osatName) -cne $osatSnapshot[$osatName]) {
-            [Environment]::SetEnvironmentVariable($osatName, $osatSnapshot[$osatName])
+            Set-Item -LiteralPath "Env:$osatName" -Value $osatSnapshot[$osatName]
         }
     }
 }

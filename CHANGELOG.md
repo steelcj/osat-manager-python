@@ -19,6 +19,10 @@ N` file and the git tags. Dates are ISO 8601.
 
 - The test suite runs on Windows: path separators, file encodings and symbolic links are handled portably, and on Windows the install tests read the version their stand-in interpreter scripts would print, since Windows cannot run them.
 
+- The `.ps1` aliases restore the session environment through PowerShell's `Env:` provider (`Remove-Item`, `Set-Item`) instead of `[Environment]::SetEnvironmentVariable`, to which PowerShell passes `$null` as an empty string, leaving deletion to the .NET version underneath. The PowerShell test now covers four paths, each printing the variables that differ: the runtime exits 0, exits 7, fails to start with the error caught, and fails to start uncaught. On Windows it runs a copy of the real interpreter rather than a stand-in script named `python.exe`, which Windows cannot run and which raised an "Unsupported 16-Bit Application" dialog.
+
+- The refusal to run as Administrator is tested on every platform, with a stand-in for `IsUserAnAdmin`.
+
 ### Added
 
 - The plain-language guide *Installing manage-python on Windows with Command Prompt*, version 0.1.2, in `en/docs/guides/osat-manager-python/`.
