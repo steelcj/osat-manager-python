@@ -1,6 +1,6 @@
 ---
 dc:title: "Windows Validation for manage-python"
-dcterms:version: "0.1.0"
+dcterms:version: "0.2.0"
 dc:creator: "Christopher Steel"
 dc:contributor: "Claude Opus 5.5 (Anthropic)"
 dc:description: "How to run validate-windows.ps1 on a fresh Windows 11 VM snapshot, the manual steps it cannot automate, and what to bring back."
@@ -20,6 +20,14 @@ sat:path: "en/docs/guides/development/"
 sat:version_at_creation: "0.4.0"
 sat:migration_status: pre-sat
 sat:changelog:
+  - version: "0.2.0"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: >
+      Added the scenario found on the Windows VM: install.ps1 run by
+      Windows PowerShell 5.1 started from a Command Prompt opened inside
+      PowerShell 7, which inherits PowerShell 7's PSModulePath. Section 11
+      of the script and manual step M6.
   - version: "0.1.0"
     date: "2026-09-29"
     author: "Christopher Steel"
@@ -28,13 +36,13 @@ sat:changelog:
 
 # Windows Validation for manage-python
 
-Version: 0.1.0
+Version: 0.2.0
 Status: Draft
 Style Guide: style-guide--technical-documentation-for-technologists
 
 ## Abstract
 
-`validate-windows.ps1` validates a manage-python release on a real Windows 11 machine under Windows PowerShell 5.1. It runs the bootstrap through `install.ps1`, the user PATH write, the `.cmd` and `.ps1` aliases under `cmd.exe` and `powershell.exe`, command precedence under the default execution policy, pip and venv behaviour, and switch, rename, remove and an offline restore. It writes one report file to bring back. A few behaviours need a person at the keyboard; they are listed below and in the report.
+`validate-windows.ps1` validates a manage-python release on a real Windows 11 machine under Windows PowerShell 5.1. It runs the bootstrap through `install.ps1`, the user PATH write, the `.cmd` and `.ps1` aliases under `cmd.exe` and `powershell.exe`, command precedence under the default execution policy, pip and venv behaviour, switch, rename, remove and an offline restore, and `install.ps1` run from a Command Prompt opened inside PowerShell 7. It writes one report file to bring back. A few behaviours need a person at the keyboard; they are listed below and in the report.
 
 ## Before you start
 
@@ -54,6 +62,12 @@ Style Guide: style-guide--technical-documentation-for-technologists
 
 The script refuses to run under PowerShell 7, from an elevated window, without `-FreshSnapshot`, or if `%LOCALAPPDATA%\python-manager` already exists. Each check prints `PASS` or `FAIL`, facts print `NOTE`, and the last line names the report file, `validate-windows-report-<computer>-<UTC>.txt`.
 
+## Windows PowerShell 5.1 started from inside PowerShell 7
+
+Windows PowerShell 5.1 started from a Command Prompt that was itself opened inside PowerShell 7 inherits PowerShell 7's `PSModulePath`. It then cannot load cmdlets that come through the module path, such as `Get-FileHash`, which is how `install.ps1` failed on the first VM run. `install.ps1` now uses only cmdlets built into 5.1 and .NET, and a unit test keeps it and the other PowerShell scripts that way.
+
+Section 11 of the script reproduces the chain when PowerShell 7 (`pwsh.exe`) is installed: PowerShell 7, then `cmd.exe`, then `powershell.exe` running `install.ps1`. It notes the `PSModulePath` that 5.1 saw, so the report shows whether the scenario was reproduced. Without PowerShell 7 the section is skipped; use manual step M6.
+
 ## Manual steps
 
 Do these after the script finishes, and write each result into the report's manual steps section.
@@ -63,6 +77,7 @@ Do these after the script finishes, and write each result into the report's manu
 - **M3:** repeat M2 in Windows PowerShell 5.1 with `python.ps1`, calling it by full path if PowerShell picks the `.cmd`. Afterwards `Get-ChildItem Env:PYTHON_MANAGER*` should list nothing.
 - **M4:** run `rundll32 sysdm.cpl,EditEnvironmentVariables` and confirm the user Path shows `%LOCALAPPDATA%\Programs` first.
 - **M5:** sign out and back in, and confirm `python` and `manage-python` still run in a new terminal.
+- **M6:** only if section 11 was skipped. Install PowerShell 7, open it, run `cmd`, then from the release folder run `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --install <a version shown by --status>`. Record whether it finishes without "is not recognized", and what `powershell -NoProfile -Command "$env:PSModulePath"` prints from that same Command Prompt.
 
 ## What to bring back
 
@@ -76,4 +91,5 @@ This document, *Windows Validation for manage-python*, by **Christopher Steel**,
 
 | Version | Status | Notes |
 |---------|--------|-------|
+| 0.2.0 | Draft | Added the `install.ps1` scenario from a Command Prompt opened inside PowerShell 7: section 11 of the script and manual step M6 |
 | 0.1.0 | Draft | Initial draft: running validate-windows.ps1 from a fresh Windows 11 snapshot, manual steps, and the report to bring back |

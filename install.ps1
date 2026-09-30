@@ -42,6 +42,25 @@ function Fail($message) {
     exit 1
 }
 
+# SHA-256 through .NET rather than Get-FileHash. In Windows PowerShell 5.1,
+# Get-FileHash is a script function that is loaded through PSModulePath, so
+# it is missing when 5.1 inherits PowerShell 7's PSModulePath, as it does
+# when started from a Command Prompt opened inside PowerShell 7. This script
+# uses only cmdlets built into 5.1 and .NET, so it works whatever that
+# inherited environment is.
+function Get-Sha256Hex([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $digest = $sha.ComputeHash($stream)
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+    return ([System.BitConverter]::ToString($digest) -replace "-", "").ToLowerInvariant()
+}
+
 function Log($message) {
     Write-Host "[install.ps1] $message"
 }
@@ -91,7 +110,7 @@ try {
     }
 
     Log "verifying checksum..."
-    $actualHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLower()
+    $actualHash = Get-Sha256Hex $ArchivePath
     if ($actualHash -ne $BootstrapSha256) {
         Fail "checksum mismatch for $BootstrapFilename`: expected $BootstrapSha256, got $actualHash"
     }

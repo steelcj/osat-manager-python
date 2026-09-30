@@ -24,7 +24,7 @@
 # Usage, from the extracted release folder with this script copied into it:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\validate-windows.ps1 -FreshSnapshot
 #
-# See en/docs/guides/development/windows-validation-for-manage-python-v0-1-0.md.
+# See en/docs/guides/development/windows-validation-for-manage-python-v0-2-0.md.
 
 param(
     [switch]$FreshSnapshot,
@@ -222,11 +222,14 @@ New-Item -ItemType Directory -Path $Work | Out-Null
 
 try {
     $Version = (Get-Content (Join-Path $Root "VERSION") -TotalCount 1).Trim()
-    $os = Get-CimInstance Win32_OperatingSystem
+    # The registry rather than Get-CimInstance: CimCmdlets is loaded through
+    # PSModulePath, which may be PowerShell 7's (see section 11).
+    $os = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
     Say "manage-python Windows validation"
     Say "  manager under test: $Version, from $Root"
     Say "  started:            $($Started.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-    Say "  machine:            $($os.Caption) $($os.Version) build $($os.BuildNumber), $env:PROCESSOR_ARCHITECTURE"
+    # ProductName still says Windows 10 on Windows 11; build 22000 and later is Windows 11.
+    Say "  machine:            $($os.ProductName) $($os.DisplayVersion) build $($os.CurrentBuild).$($os.UBR), $env:PROCESSOR_ARCHITECTURE"
     Say "  PowerShell:         $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
     Say "  culture:            $((Get-Culture).Name), UI $((Get-UICulture).Name)"
     Say "  work directory:     $Work"
@@ -466,6 +469,35 @@ if (`$before -ceq `$after) { 'ENV=unchanged' } else { 'ENV=changed' }
     Check "log actions in order" (($actions -join " ") -eq "path install install install switch alias switch install remove remove install") ($log -join "`n")
     $failed = @($log | Where-Object { $_ -match " failed: " })
     Check "only the refused remove failed" ($failed.Count -eq 1 -and $failed[0] -match " remove $([regex]::Escape($newest)) failed: ") ($log -join "`n")
+
+    # -- [11] install.ps1 from a Command Prompt opened inside PowerShell 7 ----
+    # Windows PowerShell 5.1 started this way inherits PowerShell 7's
+    # PSModulePath and cannot load script-defined cmdlets such as Get-FileHash.
+    Section "11 install.ps1 from a Command Prompt opened inside PowerShell 7"
+    $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if ($null -eq $pwsh) {
+        Note "PowerShell 7" "pwsh.exe is not installed; do manual step M6 instead"
+    } else {
+        $repro = Join-Path $Work "from-pwsh.bat"
+        Write-Text $repro @"
+@echo off
+powershell.exe -NoProfile -Command "`$env:PSModulePath"
+echo ---
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(Join-Path $Root 'install.ps1')" --install $older
+echo EXIT=%ERRORLEVEL%
+"@ -Crlf
+        # PowerShell 7 as the Start menu starts it: with the machine's
+        # PSModulePath, which it then extends for everything it runs.
+        $machineModules = [Environment]::GetEnvironmentVariable("PSModulePath", "Machine")
+        $nested = Invoke-Native $pwsh.Source "-NoProfile -NonInteractive -Command `"& cmd.exe /d /c '$repro'`"" @{ PSModulePath = $machineModules } 1800
+        Capture "PowerShell 7 > cmd.exe > powershell.exe 5.1 > install.ps1" (Show $nested)
+        $seen = ($nested.Out -split "---")[0].Trim()
+        Note "PSModulePath seen by Windows PowerShell 5.1" $seen
+        Note "PowerShell 7 module paths inherited (scenario reproduced)" ([string]($seen -match "\\PowerShell\\7\\"))
+        Check "install.ps1 exits 0 from cmd.exe inside PowerShell 7" ($nested.Out -match "EXIT=0") (Show $nested)
+        Check "no cmdlet is missing" (-not ($nested.Out + $nested.Err).Contains("is not recognized")) (Show $nested)
+        Check "the bootstrap checksum is verified and extraction follows" ($nested.Out -match "verifying checksum" -and $nested.Out -match "extracting") (Show $nested)
+    }
 }
 catch {
     Check "the validation script ran to the end" $false ($_ | Out-String)
@@ -485,6 +517,10 @@ finally {
   M4  rundll32 sysdm.cpl,EditEnvironmentVariables  opens, and user Path shows %LOCALAPPDATA%\Programs first
       result:
   M5  Sign out and in: a new terminal still runs python and manage-python
+      result:
+  M6  Only if section 11 was skipped: install PowerShell 7, open it, run cmd, then from the release folder:
+      powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --install <a version from --status>
+      Did it finish without "is not recognized"? What did  powershell -NoProfile -Command "`$env:PSModulePath"  print?
       result:
 "@
     $elapsed = [int]([DateTime]::UtcNow - $Started).TotalSeconds

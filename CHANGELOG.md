@@ -7,6 +7,21 @@ N` file and the git tags. Dates are ISO 8601.
 
 ## [Unreleased]
 
+### Fixed
+
+- `install.ps1` failed with "Get-FileHash is not recognized" when Windows PowerShell 5.1 was started from a Command Prompt opened inside PowerShell 7: 5.1 inherits PowerShell 7's `PSModulePath` and cannot load `Get-FileHash`, a script-defined cmdlet. It now computes the SHA-256 with .NET. Found on the Windows 11 VM.
+
+- Release archives no longer contain `.claude/` (session logs and assistant notes). They were in the 1.0.0 and 1.0.2 archives because those files are tracked, and `git archive`, which `publish-release.py` uses, packages every tracked file; `.gitignore` does not affect files that are already tracked. A new `.gitattributes` marks `/.claude` as `export-ignore`, so the files stay in the repository but leave release archives, and a test builds an archive to check it.
+
+### Added
+
+- The plain-language guide *Installing manage-python on Windows with Command Prompt*, version 0.1.1, in `en/docs/guides/`.
+
+### Changed
+
+- `validate-windows.ps1` reads the Windows version from the registry instead of `Get-CimInstance`, for the same reason, and adds section 11: `install.ps1` run from a Command Prompt opened inside PowerShell 7. The Windows validation instructions are at 0.2.0, with manual step M6 for machines without PowerShell 7.
+- A unit test keeps `install.ps1`, `validate-windows.ps1` and the `.ps1` alias templates to cmdlets built into Windows PowerShell 5.1.
+
 ## [1.0.2] - 2026-09-29
 
 Verified end to end on Linux x86-64. Not yet verified: on Windows, the registry write, the `.cmd` and `.ps1` aliases and `install.ps1`; macOS; Python 3.8 at run time. The Linux end-to-end pass ran on the code tagged 1.0.1; 1.0.2 changes only the Windows PATH code, which is covered by unit tests.

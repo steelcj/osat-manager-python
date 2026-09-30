@@ -2240,5 +2240,124 @@ class TestLanguage(Scratch):
         self.assertEqual(mp.available_langs(), ["en"])
 
 
+# ── PowerShell scripts under an inherited PSModulePath ────────────────────────
+
+class TestPowerShellScriptsNeedNoModulePath(unittest.TestCase):
+    """Windows PowerShell 5.1 started from a Command Prompt inside PowerShell 7
+    inherits PowerShell 7's PSModulePath, and then cannot load any cmdlet that
+    comes through the module path: script-defined ones such as Get-FileHash,
+    and separate modules such as CimCmdlets (Get-CimInstance) or
+    Microsoft.PowerShell.Archive (Expand-Archive). The scripts may use only
+    cmdlets compiled into 5.1's core snap-ins, listed here, and their own
+    functions. A cmdlet not on the list fails this test until someone checks
+    that it is compiled in and adds it."""
+
+    BUILT_IN = {
+        # Microsoft.PowerShell.Core
+        "ForEach-Object", "Where-Object", "Get-Command", "Out-Null",
+        # Microsoft.PowerShell.Management, compiled cmdlets
+        "Get-ChildItem", "Get-Content", "Get-Item", "Get-ItemProperty", "Join-Path",
+        "New-Item", "Remove-Item", "Set-Item", "Split-Path", "Test-Path",
+        # Microsoft.PowerShell.Utility, compiled cmdlets
+        "Compare-Object", "Get-Culture", "Get-Random", "Get-UICulture", "New-Object",
+        "Out-String", "Select-Object", "Sort-Object", "Write-Error", "Write-Host",
+        # Microsoft.PowerShell.Security
+        "Get-ExecutionPolicy",
+    }
+    NEEDS_MODULE_PATH = {"Get-FileHash", "Get-CimInstance", "Expand-Archive", "New-TemporaryFile",
+                         "New-Guid", "Format-Hex", "Import-PowerShellDataFile"}
+
+    def scripts(self):
+        root = _SCRIPT.parent
+        return [root / "install.ps1", root / "validate-windows.ps1",
+                *sorted((root / "scripts" / "windows").glob("*.ps1.template"))]
+
+    def cmdlets(self, path):
+        import re
+        code = "\n".join(line.split(" #")[0] for line in path.read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
+        own = set(re.findall(r"^\s*function\s+([A-Za-z]+-[A-Za-z0-9]+)", code, re.M))
+        used = set(re.findall(r"(?<![\w$.-])([A-Z][a-z]+-[A-Z][A-Za-z0-9]+)\b", code))
+        return used - own
+
+    def test_only_built_in_cmdlets(self):
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                self.assertEqual(sorted(self.cmdlets(path) - self.BUILT_IN), [])
+
+    def test_the_known_offenders_are_gone(self):
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                self.assertEqual(sorted(self.cmdlets(path) & self.NEEDS_MODULE_PATH), [])
+
+    def test_install_ps1_hashes_with_dotnet(self):
+        text = (_SCRIPT.parent / "install.ps1").read_text()
+        self.assertIn("[System.Security.Cryptography.SHA256]::Create()", text)
+        self.assertIn("$actualHash = Get-Sha256Hex $ArchivePath", text)
+
+
+# ── Release archives ──────────────────────────────────────────────────────────
+
+@unittest.skipUnless(shutil.which("git") and (_SCRIPT.parent / ".git").exists(),
+                     "needs git and a git checkout")
+class TestReleaseArchive(unittest.TestCase):
+    """publish-release.py builds release archives with git archive, so they
+    hold tracked files only; .gitignore cannot remove files that are already
+    tracked. .gitattributes marks .claude export-ignore, so session logs and
+    assistant notes stay tracked but never ship. This builds an archive with
+    publish-release.py's own build_tarball from a scratch clone, with the
+    working tree's .gitattributes committed there, so nothing is written to
+    this repository."""
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.clone), "-c", "user.name=test",
+                               "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                               *args], capture_output=True, text=True, check=True).stdout
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="manage-python-archive-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.clone = self.tmp / "clone"
+        subprocess.run(["git", "clone", "-q", "--no-hardlinks", str(_SCRIPT.parent), str(self.clone)],
+                       capture_output=True, check=True)
+        shutil.copyfile(_SCRIPT.parent / ".gitattributes", self.clone / ".gitattributes")
+        self.git("add", ".gitattributes")
+        if self.git("status", "--porcelain").strip():
+            self.git("commit", "-q", "-m", "gitattributes from the working tree")
+        # Untracked files, ignored and not, must never reach an archive either.
+        (self.clone / ".claude" / "logs").mkdir(parents=True, exist_ok=True)
+        (self.clone / ".claude" / "logs" / "untracked-session.md").write_text("x")
+        (self.clone / "dist").mkdir(exist_ok=True)
+        (self.clone / "dist" / "old.tar.gz").write_text("x")
+        (self.clone / "scratch-note.txt").write_text("x")
+
+        spec = importlib.util.spec_from_file_location("publish_release", _SCRIPT.parent / "publish-release.py")
+        self.publish = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.publish)
+        self.publish._HERE = self.clone
+        data = self.publish.build_tarball("HEAD", "osat-manager-python", "0.0.0")
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            prefix = "osat-manager-python-0.0.0/"
+            self.files = {m.name[len(prefix):] for m in tar.getmembers() if m.isfile()}
+        self.tracked = set(self.git("ls-tree", "-r", "--name-only", "HEAD").split())
+
+    def test_no_claude_directory(self):
+        self.assertEqual(sorted(f for f in self.files if f.startswith(".claude")), [])
+
+    def test_claude_files_stay_tracked(self):
+        self.assertTrue(any(f.startswith(".claude/") for f in self.tracked))
+
+    def test_only_tracked_files(self):
+        self.assertTrue(self.files)
+        self.assertEqual(sorted(self.files - self.tracked), [])
+        for untracked in ("scratch-note.txt", "dist/old.tar.gz", ".claude/logs/untracked-session.md"):
+            self.assertNotIn(untracked, self.files)
+
+    def test_everything_else_tracked_ships(self):
+        expected = {f for f in self.tracked if not f.startswith(".claude/")}
+        self.assertEqual(sorted(expected - self.files), [])
+        self.assertIn("manage-python.py", self.files)
+
+
 if __name__ == "__main__":
     unittest.main()
