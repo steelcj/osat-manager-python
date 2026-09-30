@@ -24,13 +24,15 @@
 # Usage, from the extracted release folder with this script copied into it:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\validate-windows.ps1 -FreshSnapshot
 #
-# See en/docs/guides/development/windows-validation-for-manage-python-v0-3-0.md.
+# See en/docs/guides/development/windows-validation-for-manage-python-v0-3-1.md.
 
 param(
     [switch]$FreshSnapshot,
     [string]$ReportDir = $PSScriptRoot,
     [string]$Line = "3.12",
-    [string]$Other = "3.13"
+    [string]$Other = "3.13",
+    # Installed pinned, so only the first install needs the GitHub API.
+    [string]$OlderBuild = "3.12.13+20260807"
 )
 
 $ErrorActionPreference = "Continue"
@@ -45,6 +47,8 @@ $OperatorDir = Join-Path $env:APPDATA "python-manager"
 $ReportPath = Join-Path $ReportDir "validate-windows-report-$($env:COMPUTERNAME)-$Stamp.txt"
 $Report = New-Object System.Collections.Generic.List[string]
 $Failures = New-Object System.Collections.Generic.List[string]
+$Blocked = New-Object System.Collections.Generic.List[string]
+$script:Missing = @{}
 $Captured = New-Object System.Collections.Generic.List[string]
 $script:ChildPath = $env:Path
 
@@ -72,6 +76,35 @@ function Check([string]$Name, [bool]$Condition, [string]$Detail = "") {
         if ($Detail) { Say (Indent $Detail) }
         $Failures.Add($Name)
     }
+}
+
+# A runtime an earlier step failed to install, with the reason.
+function Unavailable([string]$What, [string]$Cause) {
+    $script:Missing[$What] = $Cause
+    Say "  NOTE  ${What} is unavailable; checks that need it are BLOCKED:"
+    Say (Indent $Cause)
+}
+
+# The reason a check cannot run, or $null if everything it needs is there.
+function Needs([string[]]$What) {
+    foreach ($item in $What) {
+        if ($script:Missing.ContainsKey($item)) { return "needs $item, which is unavailable: $($script:Missing[$item])" }
+    }
+    return $null
+}
+
+function Block([string[]]$Names, [string]$Cause) {
+    foreach ($name in $Names) {
+        Say "  BLOCKED  $name"
+        Say (Indent $Cause)
+        $Blocked.Add($name)
+    }
+}
+
+function First-Line([string]$Text) {
+    $lines = @($Text -split "`r?`n" | Where-Object { $_.Trim() })
+    if ($lines.Count -gt 0) { return $lines[0] }
+    return "(no output)"
 }
 
 function Note([string]$Name, [string]$Value) {
@@ -135,7 +168,7 @@ $script:PsCount = 0
 function Invoke-Ps([string]$Body, [hashtable]$Env = @{}, [int]$Seconds = 900) {
     $script:PsCount++
     $ps1 = Join-Path $Work ("step{0:D2}.ps1" -f $script:PsCount)
-    Write-Text $ps1 $Body -Crlf
+    Write-Text $ps1 ("`$ProgressPreference = 'SilentlyContinue'`n" + $Body) -Crlf
     return Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ps1`"" $Env $Seconds
 }
 
@@ -187,6 +220,9 @@ function Get-CmdVersion([string]$Alias) {
 function Invoke-PsDefault([string]$Exe, [string]$Body, [hashtable]$Env = @{}, [int]$Seconds = 900) {
     $vars = @{ PSExecutionPolicyPreference = $null; OSAT_WORK = $Work }
     foreach ($key in $Env.Keys) { $vars[$key] = $Env[$key] }
+    # Windows PowerShell 5.1 otherwise writes "Preparing modules for first
+    # use" progress records to a redirected stderr as CLIXML.
+    $Body = "`$ProgressPreference = 'SilentlyContinue'`n" + $Body
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Body))
     return Invoke-Native $Exe "-NoProfile -NonInteractive -EncodedCommand $encoded" $vars $Seconds
 }
@@ -269,6 +305,9 @@ try {
     $pointer = Get-Pointer
     $newest = [string]$pointer["PYTHON_MANAGER_DEFAULT"]
     Check "a $Line runtime is the default" ($newest.StartsWith("$Line.")) ("pointer: " + ($pointer | Out-String))
+    if ($boot.Code -ne 0 -or -not $newest.StartsWith("$Line.")) {
+        throw "the first install failed, so nothing after it can be checked: $(First-Line $boot.Err)"
+    }
     Check "the manager installed itself" (Test-Path (Join-Path $Share "manage-python\$Version\manage-python.py"))
     Check "SELF is $Version" ($pointer["PYTHON_MANAGER_SELF"] -eq $Version)
     foreach ($name in @("python", "python$Line", "manage-python")) {
@@ -321,18 +360,32 @@ try {
     Check "manage-python.cmd --install $Other exits 0" ($third.Code -eq 0) (Show $third)
     $pointer = Get-Pointer
     $otherVersion = [string]$pointer["PYTHON_MANAGER_" + $Other.Replace(".", "_")]
-    Check "python now runs $otherVersion" ((Get-CmdVersion "python") -eq $otherVersion)
-    Check "python$Line still runs $newest" ((Get-CmdVersion "python$Line") -eq $newest)
-    Check "an unchanged PATH is not announced" (-not $third.Err.Contains("Added %LOCALAPPDATA%")) $third.Err
-    Check "an unchanged PATH is not backed up again" (@(Get-ChildItem $Logs -Filter "path-backup-*.txt").Count -eq 1)
-    Check "an unchanged PATH is not logged again" (@(Log-Lines | Where-Object { $_ -match "^\S+ path " }).Count -eq 1)
+    if ($third.Code -ne 0 -or -not $otherVersion) { Unavailable "$Other" "manage-python --install $Other failed: $(First-Line $third.Err)" }
+    $cause = Needs @("$Other")
+    if ($cause) {
+        Block @("python now runs the $Other runtime", "python$Line still runs $newest", "an unchanged PATH is not announced",
+                "an unchanged PATH is not backed up again", "an unchanged PATH is not logged again") $cause
+    } else {
+        Check "python now runs $otherVersion" ((Get-CmdVersion "python") -eq $otherVersion)
+        Check "python$Line still runs $newest" ((Get-CmdVersion "python$Line") -eq $newest)
+        Check "an unchanged PATH is not announced" (-not $third.Err.Contains("Added %LOCALAPPDATA%")) $third.Err
+        Check "an unchanged PATH is not backed up again" (@(Get-ChildItem $Logs -Filter "path-backup-*.txt").Count -eq 1)
+        Check "an unchanged PATH is not logged again" (@(Log-Lines | Where-Object { $_ -match "^\S+ path " }).Count -eq 1)
+    }
 
-    $parts = $newest.Split(".")
-    $older = "{0}.{1}.{2}" -f $parts[0], $parts[1], ([int]$parts[2] - 1)
-    $fourth = Invoke-PsDefault "powershell.exe" "manage-python --install $older; exit `$LASTEXITCODE" @{} 1800
-    Capture "manage-python --install $older from Windows PowerShell 5.1" (Show $fourth)
-    Check "manage-python --install $older from Windows PowerShell 5.1 (default policy) exits 0" ($fourth.Code -eq 0) (Show $fourth)
-    Check "python and python$Line run $older" ((Get-CmdVersion "python") -eq $older -and (Get-PsVersion "powershell.exe" "python$Line") -eq $older)
+    $older = $OlderBuild.Split("+")[0]
+    if (-not $older.StartsWith("$Line.") -or $older -eq $newest) {
+        Unavailable "$older" "-OlderBuild $OlderBuild is not a $Line version other than $newest"
+    } else {
+        $fourth = Invoke-PsDefault "powershell.exe" "manage-python --install $OlderBuild; exit `$LASTEXITCODE" @{} 1800
+        Capture "manage-python --install $OlderBuild from Windows PowerShell 5.1" (Show $fourth)
+        Check "manage-python --install $OlderBuild from Windows PowerShell 5.1 (default policy) exits 0" ($fourth.Code -eq 0) (Show $fourth)
+        Check "the pinned install makes no GitHub API call" (-not $fourth.Err.Contains("api.github.com")) (Show $fourth)
+        if ($fourth.Code -ne 0) { Unavailable "$older" "manage-python --install $OlderBuild failed: $(First-Line $fourth.Err)" }
+    }
+    $cause = Needs @("$older")
+    if ($cause) { Block @("python and python$Line run $older") $cause }
+    else { Check "python and python$Line run $older" ((Get-CmdVersion "python") -eq $older -and (Get-PsVersion "powershell.exe" "python$Line") -eq $older) }
 
     # -- [5] Aliases: arguments, exit codes, environment ---------------------------
     Section "5 The .cmd aliases from cmd.exe and from PowerShell"
@@ -378,7 +431,7 @@ python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x
         Check "$($shell.Name): `$LASTEXITCODE 0 through the .cmd" ($psOut -contains "EXIT0=0") (Show $psRun)
         Check "$($shell.Name): `$LASTEXITCODE 7 through the .cmd" ($psOut -contains "EXIT7=7") (Show $psRun)
         Check "$($shell.Name): the session environment is unchanged" ($psOut -contains "ENV=unchanged") (Show $psRun)
-        Note "$($shell.Name): what python receives for 100%, a^b, %OSAT_KEEP% and !x!" ([string]($psOut | Select-Object -Last 1))
+        Note "$($shell.Name): what python receives for 100%, a^b, %OSAT_KEEP% and !x!" ([string]($psOut | Where-Object { $_.Trim() } | Select-Object -Last 1))
     }
 
     $key = "PYTHON_MANAGER_" + $Line.Replace(".", "_")
@@ -396,15 +449,17 @@ python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x
 
     # -- [6] Which file each shell runs -------------------------------------
     Section "6 Which file each shell runs, under the default execution policy"
+    # Whatever the earlier installs managed, the line's alias runs the version the pointer names.
+    $lineNow = [string](Get-Pointer)["PYTHON_MANAGER_" + $Line.Replace(".", "_")]
     foreach ($shell in $Shells) {
         $which = Invoke-PsDefault $shell.Exe "'policy: ' + (Get-ExecutionPolicy); Get-Command python$Line -All | ForEach-Object { `"`$(`$_.CommandType) `$(`$_.Source)`" }; python$Line --version; exit `$LASTEXITCODE"
         Capture "python$Line from $($shell.Name)" (Show $which)
         Note "$($shell.Name)" ((Show $which).Trim())
         Check "$($shell.Name) finds no .ps1 for python$Line" (-not ($which.Out -match "ExternalScript")) (Show $which)
-        Check "python$Line runs in $($shell.Name) with the default execution policy" ($which.Code -eq 0 -and $which.Out -match "Python $older") (Show $which)
+        Check "python$Line runs in $($shell.Name) with the default execution policy" ($which.Code -eq 0 -and $which.Out -match "Python $([regex]::Escape($lineNow))") (Show $which)
     }
     $bare = Invoke-Cmd "python$Line --version"
-    Check "cmd.exe runs python$Line by its bare name" ($bare.Out -match "Python $older") (Show $bare)
+    Check "cmd.exe runs python$Line by its bare name" ($bare.Out -match "Python $([regex]::Escape($lineNow))") (Show $bare)
 
     # -- [7] A batch file without call ---------------------------------------------
     Section "7 A batch file calling python$Line without call"
@@ -428,7 +483,7 @@ python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x
     Check "python$Line -m venv works" ($made.Code -eq 0) (Show $made)
     $venvPython = Join-Path $venv "Scripts\python.exe"
     $venvVersion = Invoke-Native $venvPython "--version"
-    Check "the venv runs $older" ($venvVersion.Out -match "Python $older") (Show $venvVersion)
+    Check "the venv runs $lineNow" ($venvVersion.Out -match "Python $([regex]::Escape($lineNow))") (Show $venvVersion)
     $venvPip = Invoke-Native $venvPython "-m pip install --dry-run six" $offlinePip
     Check "pip in the venv is not refused as externally managed" (-not ($venvPip.Out + $venvPip.Err).Contains("externally-managed-environment")) (Show $venvPip)
 
@@ -437,14 +492,20 @@ python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x
     $r = Manage "--switch $newest"
     Check "--switch $newest" ($r.Code -eq 0) (Show $r)
     Check "python runs $newest" ((Get-CmdVersion "python") -eq $newest)
-    Check "python$Other still runs $otherVersion" ((Get-CmdVersion "python$Other") -eq $otherVersion)
+    $cause = Needs @("$Other")
+    if ($cause) { Block @("python$Other still runs the $Other runtime") $cause }
+    else { Check "python$Other still runs $otherVersion" ((Get-CmdVersion "python$Other") -eq $otherVersion) }
     $r = Manage "--alias python$Line=py312"
     Check "--alias python$Line=py312" ($r.Code -eq 0) (Show $r)
     Check "py312.cmd written, and no py312.ps1" ((Test-Path (Join-Path $Programs "py312.cmd")) -and -not (Test-Path (Join-Path $Programs "py312.ps1")))
     Check "python$Line.cmd removed" (-not (Test-Path (Join-Path $Programs "python$Line.cmd")))
     Check "py312 runs $newest from cmd.exe and Windows PowerShell 5.1" ((Get-CmdVersion "py312") -eq $newest -and (Get-PsVersion "powershell.exe" "py312") -eq $newest)
-    $r = Manage "--switch $older"
-    Check "py312 follows a switch" ($r.Code -eq 0 -and (Get-CmdVersion "py312") -eq $older) (Show $r)
+    $cause = Needs @("$older")
+    if ($cause) { Block @("py312 follows a switch") $cause }
+    else {
+        $r = Manage "--switch $older"
+        Check "py312 follows a switch" ($r.Code -eq 0 -and (Get-CmdVersion "py312") -eq $older) (Show $r)
+    }
     $r = Manage "--install $newest"
     Check "py312 follows an install and keeps its name" ($r.Code -eq 0 -and (Get-CmdVersion "py312") -eq $newest -and -not (Test-Path (Join-Path $Programs "python$Line.cmd"))) (Show $r)
     $status = Manage "--status"
@@ -454,27 +515,37 @@ python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x
     Check "--status shows the rename" ($status.Out.Contains("  aliases     py312  python")) $status.Out
     $r = Manage "--remove $newest"
     Check "--remove refuses the default" ($r.Code -eq 1) (Show $r)
-    $r = Manage "--remove $older"
-    Check "--remove $older" ($r.Code -eq 0 -and -not (Test-Path (Join-Path $Share $older))) (Show $r)
-    Check "--status lists $older as archived" ((Manage "--status").Out -match "archived    $([regex]::Escape($older))\+") ""
-    # Windows environment names ignore case, so these also cover https_proxy and http_proxy.
-    $dead = @{ HTTPS_PROXY = "http://127.0.0.1:9"; HTTP_PROXY = "http://127.0.0.1:9" }
-    $r = Manage "--install $older" $dead
-    Capture "offline restore of $older" (Show $r)
-    Check "--install $older with the network unreachable" ($r.Code -eq 0) (Show $r)
-    $provenance = Join-Path $Share "$older\PROVENANCE"
-    Check "restored from the local archive" ((Test-Path $provenance) -and ((Get-Content $provenance) -match "^source: local archive \(")) ""
-    Check "the restored runtime runs" ((Get-CmdVersion "python") -eq $older)
-    Check "the restored runtime is protected" (Test-Path (Join-Path $Share "$older\python\Lib\EXTERNALLY-MANAGED"))
+    $cause = Needs @("$older")
+    if ($cause) {
+        Block @("--remove $older", "--status lists $older as archived", "--install $older with the network unreachable",
+                "restored from the local archive", "the restored runtime runs", "the restored runtime is protected") $cause
+    } else {
+        $r = Manage "--remove $older"
+        Check "--remove $older" ($r.Code -eq 0 -and -not (Test-Path (Join-Path $Share $older))) (Show $r)
+        Check "--status lists $older as archived" ((Manage "--status").Out -match "archived    $([regex]::Escape($older))\+") ""
+        # Windows environment names ignore case, so these also cover https_proxy and http_proxy.
+        $dead = @{ HTTPS_PROXY = "http://127.0.0.1:9"; HTTP_PROXY = "http://127.0.0.1:9" }
+        $r = Manage "--install $older" $dead
+        Capture "offline restore of $older" (Show $r)
+        Check "--install $older with the network unreachable" ($r.Code -eq 0) (Show $r)
+        $provenance = Join-Path $Share "$older\PROVENANCE"
+        Check "restored from the local archive" ((Test-Path $provenance) -and ((Get-Content $provenance) -match "^source: local archive \(")) ""
+        Check "the restored runtime runs" ((Get-CmdVersion "python") -eq $older)
+        Check "the restored runtime is protected" (Test-Path (Join-Path $Share "$older\python\Lib\EXTERNALLY-MANAGED"))
+    }
 
     # -- [10] The operator log -----------------------------------------------------
     Section "10 The operator log"
     $log = @(Log-Lines)
     Capture "manage-python.log" ($log -join "`n")
-    $actions = @($log | ForEach-Object { ($_ -split " ")[1] })
-    Check "log actions in order" (($actions -join " ") -eq "path install install install switch alias switch install remove remove install") ($log -join "`n")
-    $failed = @($log | Where-Object { $_ -match " failed: " })
-    Check "only the refused remove failed" ($failed.Count -eq 1 -and $failed[0] -match " remove $([regex]::Escape($newest)) failed: ") ($log -join "`n")
+    $cause = Needs @("$Other", "$older")
+    if ($cause) { Block @("log actions in order", "only the refused remove failed") $cause }
+    else {
+        $actions = @($log | ForEach-Object { ($_ -split " ")[1] })
+        Check "log actions in order" (($actions -join " ") -eq "path install install install switch alias switch install remove remove install") ($log -join "`n")
+        $failed = @($log | Where-Object { $_ -match " failed: " })
+        Check "only the refused remove failed" ($failed.Count -eq 1 -and $failed[0] -match " remove $([regex]::Escape($newest)) failed: ") ($log -join "`n")
+    }
 
     # -- [11] install.ps1 from a Command Prompt opened inside PowerShell 7 ----
     # Windows PowerShell 5.1 started this way inherits PowerShell 7's
@@ -489,7 +560,7 @@ python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x
 @echo off
 powershell.exe -NoProfile -Command "`$env:PSModulePath"
 echo ---
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(Join-Path $Root 'install.ps1')" --install $older
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(Join-Path $Root 'install.ps1')" --install $OlderBuild
 echo EXIT=%ERRORLEVEL%
 "@ -Crlf
         # PowerShell 7 as the Start menu starts it: with the machine's
@@ -514,15 +585,19 @@ echo EXIT=%ERRORLEVEL%
 
     # -- [12] Every alias from every shell ------------------------------------
     Section "12 python, a minor line and manage-python from every shell"
+    $defaultNow = [string](Get-Pointer)["PYTHON_MANAGER_DEFAULT"]
+    $otherCause = Needs @("$Other")
     $cmdMatrix = Invoke-Cmd "call python --version`ncall python$Other --version`ncall manage-python --status"
-    Check "cmd.exe: python runs $older" ($cmdMatrix.Out -match "Python $([regex]::Escape($older))") (Show $cmdMatrix)
-    Check "cmd.exe: python$Other runs $otherVersion" ($cmdMatrix.Out -match "Python $([regex]::Escape($otherVersion))") (Show $cmdMatrix)
+    Check "cmd.exe: python runs $defaultNow" ($cmdMatrix.Out -match "Python $([regex]::Escape($defaultNow))") (Show $cmdMatrix)
+    if ($otherCause) { Block @("cmd.exe: python$Other runs the $Other runtime") $otherCause }
+    else { Check "cmd.exe: python$Other runs $otherVersion" ($cmdMatrix.Out -match "Python $([regex]::Escape($otherVersion))") (Show $cmdMatrix) }
     Check "cmd.exe: manage-python --status" ($cmdMatrix.Out -match "manage-python $([regex]::Escape($Version))") (Show $cmdMatrix)
     foreach ($shell in $Shells) {
         $matrix = Invoke-PsDefault $shell.Exe "python --version; python$Other --version; manage-python --status; exit `$LASTEXITCODE"
         Capture "every alias from $($shell.Name)" (Show $matrix)
-        Check "$($shell.Name): python runs $older" ($matrix.Out -match "Python $([regex]::Escape($older))") (Show $matrix)
-        Check "$($shell.Name): python$Other runs $otherVersion" ($matrix.Out -match "Python $([regex]::Escape($otherVersion))") (Show $matrix)
+        Check "$($shell.Name): python runs $defaultNow" ($matrix.Out -match "Python $([regex]::Escape($defaultNow))") (Show $matrix)
+        if ($otherCause) { Block @("$($shell.Name): python$Other runs the $Other runtime") $otherCause }
+        else { Check "$($shell.Name): python$Other runs $otherVersion" ($matrix.Out -match "Python $([regex]::Escape($otherVersion))") (Show $matrix) }
         Check "$($shell.Name): manage-python --status exits 0" ($matrix.Code -eq 0 -and $matrix.Out -match "manage-python $([regex]::Escape($Version))") (Show $matrix)
     }
 
@@ -546,8 +621,10 @@ echo EXIT=%ERRORLEVEL%
     Write-Text $oldPointer "# %LOCALAPPDATA%\python-manager\python-manager.env.ps1`n# Generated by manage-python.py. Read by the aliases at runtime.`n" -Crlf
     New-Item -ItemType Directory -Path $OperatorDir -Force | Out-Null
     Write-Text $operatorPs1 "`$env:OSAT_EXAMPLE = 'set by the operator'`n" -Crlf
-    $r = Manage "--switch $older"
-    Capture "--switch $older with the 1.0.2 pointer and an operator env.ps1 present" (Show $r)
+    # Section 11 installs the older build again, so it is normally on disk here.
+    $switchTo = if (Test-Path (Join-Path $Share $older)) { $older } else { $newest }
+    $r = Manage "--switch $switchTo"
+    Capture "--switch $switchTo with the 1.0.2 pointer and an operator env.ps1 present" (Show $r)
     Check "--switch deletes the pointer's .ps1 copy" ($r.Code -eq 0 -and -not (Test-Path $oldPointer)) (Show $r)
     Check "the operator's env.ps1 is left in place" (Test-Path $operatorPs1)
     Check "a warning says env.ps1 is no longer read" ($r.Err.Contains("is no longer read")) (Show $r)
@@ -581,8 +658,11 @@ finally {
 "@
     $elapsed = [int]([DateTime]::UtcNow - $Started).TotalSeconds
     Say ""
-    if ($Failures.Count -eq 0) { Say "RESULT: all automated checks passed in $elapsed s. Complete the manual steps below." }
-    else { Say "RESULT: $($Failures.Count) check(s) failed in $elapsed s: $($Failures -join '; ')" }
+    if ($Failures.Count -eq 0 -and $Blocked.Count -eq 0) { Say "RESULT: all automated checks passed in $elapsed s. Complete the manual steps below." }
+    else {
+        if ($Failures.Count -gt 0) { Say "RESULT: $($Failures.Count) check(s) failed in $elapsed s: $($Failures -join '; ')" }
+        if ($Blocked.Count -gt 0) { Say "RESULT: $($Blocked.Count) check(s) blocked by an earlier failure: $($Blocked -join '; ')" }
+    }
     $all = New-Object System.Collections.Generic.List[string]
     $all.AddRange($Report)
     $all.Add($manual)
@@ -593,5 +673,5 @@ finally {
     Write-Host ""
     Write-Host "Report: $ReportPath"
 }
-if ($Failures.Count -gt 0) { exit 1 }
+if ($Failures.Count -gt 0 -or $Blocked.Count -gt 0) { exit 1 }
 exit 0

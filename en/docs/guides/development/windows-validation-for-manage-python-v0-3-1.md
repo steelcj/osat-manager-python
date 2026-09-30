@@ -1,6 +1,6 @@
 ---
 dc:title: "Windows Validation for manage-python"
-dcterms:version: "0.3.0"
+dcterms:version: "0.3.1"
 dc:creator: "Christopher Steel"
 dc:contributor: "Claude Opus 5.5 (Anthropic)"
 dc:description: "How to run validate-windows.ps1 on a fresh Windows 11 VM snapshot, the manual steps it cannot automate, and what to bring back."
@@ -20,6 +20,14 @@ sat:path: "en/docs/guides/development/"
 sat:version_at_creation: "0.4.0"
 sat:migration_status: pre-sat
 sat:changelog:
+  - version: "0.3.1"
+    date: "2026-09-30"
+    author: "Christopher Steel"
+    notes: >
+      The older runtime is installed pinned (-OlderBuild), so only the
+      first install needs the GitHub API. A check that needs a runtime an
+      earlier step failed to install reports BLOCKED with the cause
+      instead of FAIL. Result and exit code explained.
   - version: "0.3.0"
     date: "2026-09-30"
     author: "Christopher Steel"
@@ -51,7 +59,7 @@ sat:changelog:
 
 # Windows Validation for manage-python
 
-Version: 0.3.0
+Version: 0.3.1
 Status: Draft
 Style Guide: style-guide--technical-documentation-for-technologists
 
@@ -74,6 +82,10 @@ Style Guide: style-guide--technical-documentation-for-technologists
    ```bat
    powershell -NoProfile -ExecutionPolicy Bypass -File .\validate-windows.ps1 -FreshSnapshot
    ```
+
+Only the first install asks the GitHub API which release to use. The older 3.12 runtime is installed as a pinned build, `3.12.13+20260807` by default, which needs no API call; pass `-OlderBuild <version>+<build>` to use another. The manager retries GitHub server errors and reset connections itself, so a brief GitHub outage shows up as retry lines in the captured output rather than as a failure.
+
+If an install still fails, every check that needs that runtime reports `BLOCKED`, with the install's error as the cause, instead of failing in turn. A `BLOCKED` check was not tested, so the run as a whole is not a pass: the script exits with 1 when any check failed or was blocked, and the `RESULT` lines list both. If the first install fails, nothing after it can be checked and the script stops.
 
 The script itself refuses to run under PowerShell 7, from an elevated window, without `-FreshSnapshot`, or if `%LOCALAPPDATA%\python-manager` already exists. Each check prints `PASS` or `FAIL`, facts print `NOTE`, and the last line names the report file, `validate-windows-report-<computer>-<UTC>.txt`.
 
@@ -110,6 +122,7 @@ This document, *Windows Validation for manage-python*, by **Christopher Steel**,
 
 | Version | Status | Notes |
 |---------|--------|-------|
+| 0.3.1 | Draft | Older runtime installed pinned (`-OlderBuild`); checks that need a runtime an earlier step failed to install report `BLOCKED` with the cause; result and exit code explained |
 | 0.3.0 | Draft | Windows aliases are `.cmd` files only: checks from `cmd.exe`, Windows PowerShell 5.1 and PowerShell 7 under the default execution policy, argument pass-through and exit codes through the `.cmd` layer, the pip message, and retirement of the `.ps1` aliases and PowerShell pointer left by 1.0.2; section 11 recognises PowerShell 7's module paths, the Store install included; running from Command Prompt documented; M3 rewritten |
 | 0.2.0 | Draft | Added the `install.ps1` scenario from a Command Prompt opened inside PowerShell 7: section 11 of the script and manual step M6 |
 | 0.1.0 | Draft | Initial draft: running validate-windows.ps1 from a fresh Windows 11 snapshot, manual steps, and the report to bring back |

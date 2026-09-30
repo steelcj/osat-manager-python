@@ -2546,5 +2546,130 @@ class TestLegacyWindowsPointer(Lifecycle):
         self.assertNotIn("no longer read", self.err.getvalue())
 
 
+# ── Network retries ───────────────────────────────────────────────────────────
+
+class ScriptedUrlopen:
+    """Stands in for urllib.request.urlopen: each call takes the next outcome,
+    an exception to raise or bytes to serve, and records the URL."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.urls = []
+
+    def __call__(self, request, timeout=None):
+        self.urls.append(request.full_url)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if callable(outcome):
+            return outcome()
+        return io.BytesIO(outcome)
+
+
+def http_error(code, url="https://api.github.com/repos/x/releases"):
+    import urllib.error
+    return urllib.error.HTTPError(url, code, f"status {code}", {}, None)
+
+
+class ResetMidBody(io.BytesIO):
+    """A response whose body is cut off by a connection reset."""
+
+    def read(self, *args):
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+
+class TestNetworkRetries(unittest.TestCase):
+    """GitHub server errors (5xx) and reset connections are retried: three
+    attempts in all, waiting about 2 then 5 seconds. Rate limits, 404s and an
+    unreachable network fail at once. Retries are reported on standard error."""
+
+    API = "https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=30&page=1"
+
+    def run_net(self, method, *outcomes, url=API, **kwargs):
+        import urllib.error                                    # noqa: F401
+        fake = ScriptedUrlopen(*outcomes)
+        waits = []
+        net = mp.Network(environ={}, sleep=waits.append)
+        err = io.StringIO()
+        with mock.patch.object(mp.urllib.request, "urlopen", fake), redirect_stderr(err):
+            try:
+                result = getattr(net, method)(url, **kwargs)
+                error = None
+            except mp.ManagerError as caught:
+                result, error = None, caught
+        return result, error, waits, fake, err.getvalue()
+
+    def test_a_504_then_success(self):
+        result, error, waits, fake, err = self.run_net("get_text", http_error(504), b"ok")
+        self.assertEqual((result, error), ("ok", None))
+        self.assertEqual(waits, [2.0])
+        self.assertEqual(len(fake.urls), 2)
+        self.assertIn("GitHub answered 504", err)
+        self.assertIn("retrying in 2 s (attempt 2 of 3)", err)
+
+    def test_a_reset_then_success(self):
+        import urllib.error
+        reset = urllib.error.URLError(ConnectionResetError(104, "reset"))
+        result, error, waits, _f, err = self.run_net("get_json", reset, b'{"tag_name": "20260924"}')
+        self.assertEqual(result, {"tag_name": "20260924"})
+        self.assertEqual(waits, [2.0])
+        self.assertIn("the connection was reset", err)
+
+    def test_keeps_failing(self):
+        result, error, waits, fake, err = self.run_net(
+            "get_text", http_error(502), http_error(503), http_error(504))
+        self.assertIsNone(result)
+        self.assertIn("download failed (504)", str(error))
+        self.assertEqual(waits, [2.0, 5.0])
+        self.assertEqual(len(fake.urls), 3)
+        self.assertEqual(err.count("retrying in"), 2)
+
+    def test_not_retried(self):
+        import socket
+        import urllib.error
+        cases = {
+            "403 rate limit": (http_error(403), "rate limit"),
+            "429 rate limit": (http_error(429), "rate limit"),
+            "404": (http_error(404), "download failed (404)"),
+            "refused": (urllib.error.URLError(ConnectionRefusedError(111, "refused")), "network error"),
+            "no DNS": (urllib.error.URLError(socket.gaierror(-2, "Name or service not known")), "network error"),
+        }
+        for name, (outcome, message) in cases.items():
+            with self.subTest(case=name):
+                result, error, waits, fake, err = self.run_net("get_text", outcome, b"never")
+                self.assertIn(message, str(error))
+                self.assertEqual((waits, len(fake.urls), err), ([], 1, ""))
+
+    def test_a_download_reset_mid_body_starts_the_file_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "runtime.tar.gz"
+            target.write_bytes(b"stale")
+            _r, error, waits, fake, _e = self.run_net(
+                "download", lambda: ResetMidBody(b""), b"complete tarball",
+                url="https://github.com/x/releases/download/1/a.tar.gz", destination=target)
+            self.assertIsNone(error)
+            self.assertEqual(target.read_bytes(), b"complete tarball")
+            self.assertEqual((waits, len(fake.urls)), ([2.0], 2))
+
+    def test_retries_are_not_logged_only_the_result(self):
+        paths = mp.Paths(windows=False, environ={}, home=Path(tempfile.gettempdir()))
+        net = mp.Network(environ={}, sleep=lambda delay: None)
+        fake = ScriptedUrlopen(http_error(504), http_error(504), http_error(504))
+        with mock.patch.object(mp, "Paths", return_value=paths), \
+             mock.patch.object(mp, "Network", return_value=net), \
+             mock.patch.object(mp.urllib.request, "urlopen", fake), \
+             mock.patch.object(mp, "append_log") as append_log, \
+             mock.patch.object(mp, "detect_triple", return_value="x86_64-unknown-linux-gnu"), \
+             mock.patch.object(mp, "check_sandbox"), \
+             redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(mp.main(["--install", "3.13"]), 1)
+        self.assertEqual(err.getvalue().count("retrying in"), 2)
+        self.assertEqual(append_log.call_count, 1)
+        self.assertIn("failed: download failed (504)", append_log.call_args[0][3])
+
+    def test_the_default_waits(self):
+        self.assertEqual(mp.RETRY_DELAYS, (2.0, 5.0))
+
+
 if __name__ == "__main__":
     unittest.main()

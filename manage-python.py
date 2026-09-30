@@ -58,6 +58,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -1287,48 +1288,87 @@ class Build:
         return f"{self.version}+{self.build}"
 
 
+# Waits before the second and third attempts of a GitHub request that failed
+# in a way worth retrying: three attempts in all.
+RETRY_DELAYS = (2.0, 5.0)
+
+
+def retryable(error: BaseException) -> bool:
+    """A GitHub server error (5xx) or a reset connection, which usually
+    passes. Rate limits (403, 429), 404s and an unreachable network do not."""
+    if isinstance(error, urllib.error.HTTPError):
+        return 500 <= error.code <= 599
+    if isinstance(error, urllib.error.URLError):
+        return isinstance(error.reason, ConnectionResetError)
+    return isinstance(error, ConnectionResetError)
+
+
 class Network:
     """The manager's only contact with the outside world, so tests can
     replace it. A GITHUB_TOKEN in the environment is sent to the GitHub API
-    only, never to download hosts, for a higher rate limit."""
+    only, never to download hosts, for a higher rate limit. Every request is
+    retried, as a whole, after a server error or a reset connection."""
 
-    def __init__(self, environ: Optional[Mapping[str, str]] = None) -> None:
+    def __init__(self, environ: Optional[Mapping[str, str]] = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 retry_delays: Tuple[float, ...] = RETRY_DELAYS) -> None:
         env = os.environ if environ is None else environ
         self.token = env.get("GITHUB_TOKEN") or ""
         self.user_agent = f"{PROJECT}/{manager_version()}"
+        self.sleep = sleep
+        self.retry_delays = retry_delays
 
-    def _open(self, url: str, timeout: int):
+    def _request(self, url: str) -> urllib.request.Request:
         headers = {"User-Agent": self.user_agent}
         if url.startswith("https://api.github.com/"):
             headers["Accept"] = "application/vnd.github+json"
             if self.token:
                 headers["Authorization"] = f"Bearer {self.token}"
-        request = urllib.request.Request(url, headers=headers)
-        try:
-            return urllib.request.urlopen(request, timeout=timeout)
-        except urllib.error.HTTPError as error:
-            if error.code == 403 and "api.github.com" in url:
-                raise ManagerError(_(
+        return urllib.request.Request(url, headers=headers)
+
+    def _fetch(self, url: str, timeout: int, consume: Callable):
+        """Open `url` and hand the response to `consume`, retrying the whole
+        exchange after a retryable failure. Each retry is reported on
+        standard error; only the final outcome reaches the caller."""
+        attempts = len(self.retry_delays) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(self._request(url), timeout=timeout) as response:
+                    return consume(response)
+            except (urllib.error.URLError, OSError) as error:
+                if attempt < attempts and retryable(error):
+                    delay = self.retry_delays[attempt - 1]
+                    problem = (f"GitHub answered {error.code}"
+                               if isinstance(error, urllib.error.HTTPError) else _("the connection was reset"))
+                    log(_("{problem} for {url}; retrying in {delay:g} s (attempt {next} of {total})")
+                        .format(problem=problem, url=url, delay=delay, next=attempt + 1, total=attempts))
+                    self.sleep(delay)
+                    continue
+                raise self._failure(error, url) from None
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _failure(error: BaseException, url: str) -> ManagerError:
+        if isinstance(error, urllib.error.HTTPError):
+            if error.code in (403, 429) and "api.github.com" in url:
+                return ManagerError(_(
                     "GitHub API rate limit reached. Wait and retry, set GITHUB_TOKEN, "
                     "or install a pinned build such as 3.12.14+20260924, which needs no API call"
-                )) from None
-            raise ManagerError(_("download failed ({code}) for {url}")
-                               .format(code=error.code, url=url)) from None
-        except (urllib.error.URLError, OSError) as error:
-            raise ManagerError(_("network error for {url}: {error}")
-                               .format(url=url, error=error)) from None
+                ))
+            return ManagerError(_("download failed ({code}) for {url}").format(code=error.code, url=url))
+        return ManagerError(_("network error for {url}: {error}").format(url=url, error=error))
 
     def get_json(self, url: str):
-        with self._open(url, 30) as response:
-            return json.loads(response.read().decode("utf-8"))
+        return self._fetch(url, 30, lambda response: json.loads(response.read().decode("utf-8")))
 
     def get_text(self, url: str) -> str:
-        with self._open(url, 60) as response:
-            return response.read().decode("utf-8")
+        return self._fetch(url, 60, lambda response: response.read().decode("utf-8"))
 
     def download(self, url: str, destination: Path) -> None:
-        with self._open(url, 120) as response, open(destination, "wb") as out:
-            shutil.copyfileobj(response, out)
+        def save(response) -> None:
+            with open(destination, "wb") as out:        # a retry starts the file again
+                shutil.copyfileobj(response, out)
+        self._fetch(url, 120, save)
 
 
 def parse_spec(spec: str) -> Tuple[str, str]:

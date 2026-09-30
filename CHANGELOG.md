@@ -27,6 +27,8 @@ N` file and the git tags. Dates are ISO 8601.
 
 ### Added
 
+- GitHub requests are retried after a server error (5xx) or a reset connection: three attempts in all, about 2 then 5 seconds apart, for release lookups, SHA256SUMS and downloads alike, a download starting its file again. Rate limits (403, 429), 404s, checksum mismatches and an unreachable network fail at once. Each retry is reported on standard error; only the final result is logged. A 504 from the GitHub API failed a whole install on the Windows 11 VM.
+
 - The plain-language guide *Installing manage-python on Windows with Command Prompt*, version 0.1.2, in `en/docs/guides/osat-manager-python/`.
 
 ### Changed
@@ -36,6 +38,8 @@ N` file and the git tags. Dates are ISO 8601.
 - On Windows the pointer is `python-manager.env.cmd` only and the operator environment is `env.cmd` only, since every alias is a `.cmd` file. `--install`, `--switch`, `--alias` and `--remove` delete the `python-manager.env.ps1` an earlier version wrote, recognised by its header. An operator `%APPDATA%\python-manager\env.ps1` is left in place, with a warning, shown once, that it is no longer read and that its settings belong in `env.cmd`.
 
 - `en/docs/python-tool-README-v3.md`, the 0.2.0 documentation, is removed; it remains in the git history and in the 0.2.0 release.
+
+- `validate-windows.ps1` installs the older runtime as a pinned build (`-OlderBuild`, `3.12.13+20260807` by default), so only the first install depends on the GitHub API, and reports the checks that need a runtime an earlier step failed to install as `BLOCKED` with the cause, instead of as a cascade of failures. Every PowerShell session it starts sets `$ProgressPreference = 'SilentlyContinue'`, and the `cmd.exe` quirk note shows the last non-empty line. The Windows validation instructions are at 0.3.1.
 
 - `validate-windows.ps1` checks the `.cmd` aliases from `cmd.exe`, Windows PowerShell 5.1 and PowerShell 7 under the default execution policy, including argument pass-through and exit codes through the `.cmd` layer, notes what `cmd.exe` does to `%` and `^` in arguments, checks the pip message, and checks that `.ps1` aliases left by 1.0.2 are removed. The Windows validation instructions are at 0.3.0.
 
