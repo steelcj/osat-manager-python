@@ -24,7 +24,7 @@
 # Usage, from the extracted release folder with this script copied into it:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\validate-windows.ps1 -FreshSnapshot
 #
-# See en/docs/guides/development/windows-validation-for-manage-python-v0-2-0.md.
+# See en/docs/guides/development/windows-validation-for-manage-python-v0-3-0.md.
 
 param(
     [switch]$FreshSnapshot,
@@ -178,9 +178,22 @@ function Get-CmdVersion([string]$Alias) {
     return "none: " + (Show $result)
 }
 
-# The version an alias runs, through its .ps1 under powershell.exe 5.1.
-function Get-Ps1Version([string]$Alias) {
-    $result = Invoke-Ps "& (Join-Path `$env:LOCALAPPDATA 'Programs\$Alias.ps1') --version"
+# Run PowerShell code as a user's session runs it: the machine's default
+# execution policy (this script's -ExecutionPolicy Bypass is not passed on:
+# it travels in PSExecutionPolicyPreference, which is removed), no profile,
+# and the code passed as an encoded command, which even the Restricted
+# policy allows. $Exe is powershell.exe or pwsh.exe. OSAT_WORK names the
+# work directory, so no path is quoted into the code.
+function Invoke-PsDefault([string]$Exe, [string]$Body, [hashtable]$Env = @{}, [int]$Seconds = 900) {
+    $vars = @{ PSExecutionPolicyPreference = $null; OSAT_WORK = $Work }
+    foreach ($key in $Env.Keys) { $vars[$key] = $Env[$key] }
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Body))
+    return Invoke-Native $Exe "-NoProfile -NonInteractive -EncodedCommand $encoded" $vars $Seconds
+}
+
+# The version an alias runs when a PowerShell session calls it by name.
+function Get-PsVersion([string]$Exe, [string]$Alias) {
+    $result = Invoke-PsDefault $Exe "$Alias --version; exit `$LASTEXITCODE"
     if ($result.Out -match "Python (\d+\.\d+\.\d+)") { return $Matches[1] }
     return "none: " + (Show $result)
 }
@@ -219,6 +232,9 @@ if ($problems.Count -gt 0) {
     exit 2
 }
 New-Item -ItemType Directory -Path $Work | Out-Null
+$Shells = @(@{ Name = "Windows PowerShell 5.1"; Exe = "powershell.exe" })
+$PwshCommand = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+if ($null -ne $PwshCommand) { $Shells += @{ Name = "PowerShell 7"; Exe = $PwshCommand.Source } }
 
 try {
     $Version = (Get-Content (Join-Path $Root "VERSION") -TotalCount 1).Trim()
@@ -256,10 +272,10 @@ try {
     Check "the manager installed itself" (Test-Path (Join-Path $Share "manage-python\$Version\manage-python.py"))
     Check "SELF is $Version" ($pointer["PYTHON_MANAGER_SELF"] -eq $Version)
     foreach ($name in @("python", "python$Line", "manage-python")) {
-        foreach ($extension in @("cmd", "ps1")) {
-            Check "alias $name.$extension written" (Test-Path (Join-Path $Programs "$name.$extension"))
-        }
+        Check "alias $name.cmd written" (Test-Path (Join-Path $Programs "$name.cmd"))
+        Check "no $name.ps1 written" (-not (Test-Path (Join-Path $Programs "$name.ps1")))
     }
+    Check "only the .cmd pointer is written" ((Test-Path (Join-Path $Share "python-manager.env.cmd")) -and -not (Test-Path (Join-Path $Share "python-manager.env.ps1")))
     Check "no bootstrap Python left in TEMP" (@(Get-ChildItem $env:TEMP -Filter "osat-manager-python-bootstrap-*" -ErrorAction SilentlyContinue).Count -eq 0)
 
     # -- [3] The user PATH write ---------------------------------------------------
@@ -313,18 +329,17 @@ try {
 
     $parts = $newest.Split(".")
     $older = "{0}.{1}.{2}" -f $parts[0], $parts[1], ([int]$parts[2] - 1)
-    $fourth = Invoke-Ps "& (Join-Path `$env:LOCALAPPDATA 'Programs\manage-python.ps1') --install $older; exit `$LASTEXITCODE" @{} 1800
-    Capture "manage-python.ps1 --install $older" (Show $fourth)
-    Check "manage-python.ps1 --install $older exits 0" ($fourth.Code -eq 0) (Show $fourth)
-    Check "python and python$Line run $older" ((Get-CmdVersion "python") -eq $older -and (Get-Ps1Version "python$Line") -eq $older)
+    $fourth = Invoke-PsDefault "powershell.exe" "manage-python --install $older; exit `$LASTEXITCODE" @{} 1800
+    Capture "manage-python --install $older from Windows PowerShell 5.1" (Show $fourth)
+    Check "manage-python --install $older from Windows PowerShell 5.1 (default policy) exits 0" ($fourth.Code -eq 0) (Show $fourth)
+    Check "python and python$Line run $older" ((Get-CmdVersion "python") -eq $older -and (Get-PsVersion "powershell.exe" "python$Line") -eq $older)
 
     # -- [5] Aliases: arguments, exit codes, environment ---------------------------
-    Section "5 The .cmd and .ps1 aliases"
+    Section "5 The .cmd aliases from cmd.exe and from PowerShell"
     Write-Text (Join-Path $Work "args.py") "import json, os, sys`nprint(json.dumps({'argv': sys.argv[1:], 'keep': os.environ.get('OSAT_KEEP')}))`n"
     Write-Text (Join-Path $Work "exitcode.py") "import sys`nsys.exit(int(sys.argv[1]))`n"
     New-Item -ItemType Directory -Path $OperatorDir -Force | Out-Null
     Write-Text (Join-Path $OperatorDir "env.cmd") "set `"OSAT_KEEP=changed-by-operator`"`n" -Crlf
-    Write-Text (Join-Path $OperatorDir "env.ps1") "`$env:OSAT_KEEP = 'changed-by-operator'`n`$env:OSAT_ADDED = 'added-by-operator'`n" -Crlf
     $expectedArgs = '{"argv": ["a b", "c", "d=e", "f,g"], "keep": "changed-by-operator"}'
 
     $cmdRun = Invoke-Cmd @"
@@ -338,66 +353,56 @@ if defined PYTHON_MANAGER_DEFAULT (echo LEAK=yes) else (echo LEAK=no)
 "@
     Capture "python$Line.cmd under cmd.exe" (Show $cmdRun)
     $cmdOut = @($cmdRun.Out -split "`r?`n")
-    Check ".cmd passes arguments through" ($cmdOut -contains $expectedArgs) (Show $cmdRun)
-    Check ".cmd returns exit code 0" ($cmdOut -contains "EXIT0=0") (Show $cmdRun)
-    Check ".cmd returns exit code 7" ($cmdOut -contains "EXIT7=7") (Show $cmdRun)
-    Check ".cmd reads the operator env.cmd, then setlocal restores the caller's value" ($cmdOut -contains "KEEP=before") (Show $cmdRun)
-    Check ".cmd leaves no pointer variables behind" ($cmdOut -contains "LEAK=no") (Show $cmdRun)
+    Check "cmd.exe: arguments pass through" ($cmdOut -contains $expectedArgs) (Show $cmdRun)
+    Check "cmd.exe: exit code 0" ($cmdOut -contains "EXIT0=0") (Show $cmdRun)
+    Check "cmd.exe: exit code 7" ($cmdOut -contains "EXIT7=7") (Show $cmdRun)
+    Check "cmd.exe: the operator env.cmd is read, then setlocal restores the caller's value" ($cmdOut -contains "KEEP=before") (Show $cmdRun)
+    Check "cmd.exe: no pointer variables left behind" ($cmdOut -contains "LEAK=no") (Show $cmdRun)
 
     $psBody = @"
 `$env:OSAT_KEEP = 'before'
 function Snap { (Get-ChildItem Env: | Sort-Object Name | ForEach-Object { "`$(`$_.Name)=`$(`$_.Value)" }) -join "``n" }
-`$alias = Join-Path `$env:LOCALAPPDATA 'Programs\python$Line.ps1'
 `$before = Snap
-& `$alias (Join-Path `$PSScriptRoot 'args.py') 'a b' c 'd=e' 'f,g'
+python$Line (Join-Path `$env:OSAT_WORK 'args.py') 'a b' c 'd=e' 'f,g'
 "EXIT0=`$LASTEXITCODE"
-& `$alias (Join-Path `$PSScriptRoot 'exitcode.py') 7
+python$Line (Join-Path `$env:OSAT_WORK 'exitcode.py') 7
 "EXIT7=`$LASTEXITCODE"
-`$after = Snap
-if (`$before -ceq `$after) { 'ENV=unchanged' } else {
-    'ENV=changed'
-    Compare-Object (`$before -split "``n") (`$after -split "``n") | ForEach-Object { "DIFF `$(`$_.SideIndicator) `$(`$_.InputObject)" }
-}
+if (`$before -ceq (Snap)) { 'ENV=unchanged' } else { 'ENV=changed' }
+python$Line (Join-Path `$env:OSAT_WORK 'args.py') '100%' 'a^b' '%OSAT_KEEP%' '!x!'
 "@
-    $psRun = Invoke-Ps $psBody
-    Capture "python$Line.ps1 under powershell.exe 5.1" (Show $psRun)
-    $psOut = @($psRun.Out -split "`r?`n")
-    Check ".ps1 passes arguments through" ($psOut -contains $expectedArgs) (Show $psRun)
-    Check ".ps1 sets `$LASTEXITCODE 0" ($psOut -contains "EXIT0=0") (Show $psRun)
-    Check ".ps1 sets `$LASTEXITCODE 7" ($psOut -contains "EXIT7=7") (Show $psRun)
-    Check ".ps1 leaves the session environment unchanged" ($psOut -contains "ENV=unchanged") (Show $psRun)
-    $psFile = Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$(Join-Path $Programs "python$Line.ps1")`" `"$(Join-Path $Work 'exitcode.py')`" 7"
-    Check ".ps1 run with -File exits 7" ($psFile.Code -eq 7) (Show $psFile)
+    foreach ($shell in $Shells) {
+        $psRun = Invoke-PsDefault $shell.Exe $psBody
+        Capture "python$Line.cmd from $($shell.Name)" (Show $psRun)
+        $psOut = @($psRun.Out -split "`r?`n")
+        Check "$($shell.Name): arguments pass through the .cmd" ($psOut -contains $expectedArgs) (Show $psRun)
+        Check "$($shell.Name): `$LASTEXITCODE 0 through the .cmd" ($psOut -contains "EXIT0=0") (Show $psRun)
+        Check "$($shell.Name): `$LASTEXITCODE 7 through the .cmd" ($psOut -contains "EXIT7=7") (Show $psRun)
+        Check "$($shell.Name): the session environment is unchanged" ($psOut -contains "ENV=unchanged") (Show $psRun)
+        Note "$($shell.Name): what python receives for 100%, a^b, %OSAT_KEEP% and !x!" ([string]($psOut | Select-Object -Last 1))
+    }
 
-    Write-Text (Join-Path $OperatorDir "env.cmd") "set `"PYTHON_MANAGER_$($Line.Replace('.', '_'))=`"`n" -Crlf
-    Write-Text (Join-Path $OperatorDir "env.ps1") "Remove-Item Env:PYTHON_MANAGER_$($Line.Replace('.', '_')) -ErrorAction SilentlyContinue`n" -Crlf
     $key = "PYTHON_MANAGER_" + $Line.Replace(".", "_")
+    Write-Text (Join-Path $OperatorDir "env.cmd") "set `"$key=`"`n" -Crlf
     $unsetCmd = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\python$Line.cmd`" --version`necho EXIT=%ERRORLEVEL%"
-    Capture "python$Line.cmd with $key unset" (Show $unsetCmd)
-    Check ".cmd with the key unset exits 1" (@($unsetCmd.Out -split "`r?`n") -contains "EXIT=1") (Show $unsetCmd)
-    Check ".cmd with the key unset says so" ($unsetCmd.Err.Contains("$key is not set")) (Show $unsetCmd)
-    $unsetPs = Invoke-Ps @"
-function Snap { (Get-ChildItem Env: | Sort-Object Name | ForEach-Object { "`$(`$_.Name)=`$(`$_.Value)" }) -join "``n" }
-`$before = Snap
-try { & (Join-Path `$env:LOCALAPPDATA 'Programs\python$Line.ps1') --version } catch { "CAUGHT=`$(`$_.Exception.Message)" }
-`$after = Snap
-if (`$before -ceq `$after) { 'ENV=unchanged' } else { 'ENV=changed' }
-"@
-    Capture "python$Line.ps1 with $key unset" (Show $unsetPs)
-    Check ".ps1 with the key unset stops with the message" (($unsetPs.Out + $unsetPs.Err).Contains("$key is not set")) (Show $unsetPs)
-    Check ".ps1 with the key unset still restores the environment" (@($unsetPs.Out -split "`r?`n") -contains "ENV=unchanged") (Show $unsetPs)
-    Remove-Item (Join-Path $OperatorDir "env.cmd"), (Join-Path $OperatorDir "env.ps1")
+    Capture "python$Line.cmd with $key unset, from cmd.exe" (Show $unsetCmd)
+    Check "cmd.exe: with the key unset the alias exits 1" (@($unsetCmd.Out -split "`r?`n") -contains "EXIT=1") (Show $unsetCmd)
+    Check "cmd.exe: with the key unset the alias says so" ($unsetCmd.Err.Contains("$key is not set")) (Show $unsetCmd)
+    foreach ($shell in $Shells) {
+        $unsetPs = Invoke-PsDefault $shell.Exe "python$Line --version; `"EXIT=`$LASTEXITCODE`""
+        Capture "python$Line with $key unset, from $($shell.Name)" (Show $unsetPs)
+        Check "$($shell.Name): with the key unset the alias exits 1 and says so" ((@($unsetPs.Out -split "`r?`n") -contains "EXIT=1") -and ($unsetPs.Out + $unsetPs.Err).Contains("$key is not set")) (Show $unsetPs)
+    }
+    Remove-Item (Join-Path $OperatorDir "env.cmd")
 
-    # -- [6] Which file PowerShell runs --------------------------------------------
-    Section "6 Command precedence and execution policy"
-    $which = Invoke-Ps "Get-Command python$Line -All | ForEach-Object { `"`$(`$_.CommandType) `$(`$_.Source)`" }"
-    Note "Get-Command python$Line -All (bypassed policy)" $which.Out.Trim()
-    # -ExecutionPolicy Bypass on this script sets PSExecutionPolicyPreference, which
-    # children inherit; removing it gives the child the machine's real default.
-    $default = Invoke-Native "powershell.exe" "-NoProfile -NonInteractive -Command `"'policy: ' + (Get-ExecutionPolicy); 'picks: ' + (Get-Command python$Line).Source; python$Line --version`"" @{ PSExecutionPolicyPreference = $null }
-    Capture "default execution policy: python$Line --version" (Show $default)
-    Note "default execution policy session" ((Show $default).Trim())
-    Check "python$Line runs in a PowerShell 5.1 session with the default execution policy" ($default.Code -eq 0 -and $default.Out -match "Python $older") (Show $default)
+    # -- [6] Which file each shell runs -------------------------------------
+    Section "6 Which file each shell runs, under the default execution policy"
+    foreach ($shell in $Shells) {
+        $which = Invoke-PsDefault $shell.Exe "'policy: ' + (Get-ExecutionPolicy); Get-Command python$Line -All | ForEach-Object { `"`$(`$_.CommandType) `$(`$_.Source)`" }; python$Line --version; exit `$LASTEXITCODE"
+        Capture "python$Line from $($shell.Name)" (Show $which)
+        Note "$($shell.Name)" ((Show $which).Trim())
+        Check "$($shell.Name) finds no .ps1 for python$Line" (-not ($which.Out -match "ExternalScript")) (Show $which)
+        Check "python$Line runs in $($shell.Name) with the default execution policy" ($which.Code -eq 0 -and $which.Out -match "Python $older") (Show $which)
+    }
     $bare = Invoke-Cmd "python$Line --version"
     Check "cmd.exe runs python$Line by its bare name" ($bare.Out -match "Python $older") (Show $bare)
 
@@ -415,6 +420,9 @@ if (`$before -ceq `$after) { 'ENV=unchanged' } else { 'ENV=changed' }
     $pip = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\python$Line.cmd`" -m pip install --dry-run six" $offlinePip
     Capture "pip install into the runtime" (Show $pip)
     Check "pip refuses to install into the runtime" ($pip.Code -ne 0 -and ($pip.Out + $pip.Err).Contains("externally-managed-environment")) (Show $pip)
+    $pipLines = @(($pip.Out + $pip.Err) -split "`r?`n" | ForEach-Object { $_.Trim() })
+    Check "pip's message names python$Line -m venv .venv on a line of its own" ($pipLines -contains "python$Line -m venv .venv") (Show $pip)
+    Check "pip's message has no stray '.' line" (-not ($pipLines -contains ".")) (Show $pip)
     $venv = Join-Path $Work "venv"
     $made = Invoke-Cmd "call `"%LOCALAPPDATA%\Programs\python$Line.cmd`" -m venv `"$venv`""
     Check "python$Line -m venv works" ($made.Code -eq 0) (Show $made)
@@ -432,9 +440,9 @@ if (`$before -ceq `$after) { 'ENV=unchanged' } else { 'ENV=changed' }
     Check "python$Other still runs $otherVersion" ((Get-CmdVersion "python$Other") -eq $otherVersion)
     $r = Manage "--alias python$Line=py312"
     Check "--alias python$Line=py312" ($r.Code -eq 0) (Show $r)
-    Check "py312.cmd and py312.ps1 written" ((Test-Path (Join-Path $Programs "py312.cmd")) -and (Test-Path (Join-Path $Programs "py312.ps1")))
-    Check "python$Line.cmd and .ps1 removed" (-not (Test-Path (Join-Path $Programs "python$Line.cmd")) -and -not (Test-Path (Join-Path $Programs "python$Line.ps1")))
-    Check "py312 runs $newest (.cmd and .ps1)" ((Get-CmdVersion "py312") -eq $newest -and (Get-Ps1Version "py312") -eq $newest)
+    Check "py312.cmd written, and no py312.ps1" ((Test-Path (Join-Path $Programs "py312.cmd")) -and -not (Test-Path (Join-Path $Programs "py312.ps1")))
+    Check "python$Line.cmd removed" (-not (Test-Path (Join-Path $Programs "python$Line.cmd")))
+    Check "py312 runs $newest from cmd.exe and Windows PowerShell 5.1" ((Get-CmdVersion "py312") -eq $newest -and (Get-PsVersion "powershell.exe" "py312") -eq $newest)
     $r = Manage "--switch $older"
     Check "py312 follows a switch" ($r.Code -eq 0 -and (Get-CmdVersion "py312") -eq $older) (Show $r)
     $r = Manage "--install $newest"
@@ -458,8 +466,6 @@ if (`$before -ceq `$after) { 'ENV=unchanged' } else { 'ENV=changed' }
     Check "restored from the local archive" ((Test-Path $provenance) -and ((Get-Content $provenance) -match "^source: local archive \(")) ""
     Check "the restored runtime runs" ((Get-CmdVersion "python") -eq $older)
     Check "the restored runtime is protected" (Test-Path (Join-Path $Share "$older\python\Lib\EXTERNALLY-MANAGED"))
-    $mstatus = Invoke-Ps "& (Join-Path `$env:LOCALAPPDATA 'Programs\manage-python.ps1') --status; exit `$LASTEXITCODE"
-    Check "manage-python.ps1 --status exits 0" ($mstatus.Code -eq 0) (Show $mstatus)
 
     # -- [10] The operator log -----------------------------------------------------
     Section "10 The operator log"
@@ -493,11 +499,61 @@ echo EXIT=%ERRORLEVEL%
         Capture "PowerShell 7 > cmd.exe > powershell.exe 5.1 > install.ps1" (Show $nested)
         $seen = ($nested.Out -split "---")[0].Trim()
         Note "PSModulePath seen by Windows PowerShell 5.1" $seen
-        Note "PowerShell 7 module paths inherited (scenario reproduced)" ([string]($seen -match "\\PowerShell\\7\\"))
+        # PowerShell 7's paths end in \PowerShell\Modules (user and Program
+        # Files), \PowerShell\7\Modules, or, for the Store install,
+        # \microsoft.powershell_<version>...\Modules; Windows PowerShell's
+        # end in \WindowsPowerShell\...\Modules and do not match.
+        $ps7Pattern = '(?i)(\\PowerShell\\(7[^\\]*\\)?Modules|\\microsoft\.powershell_[^\\]*\\Modules)\\?$'
+        $ps7Entries = @($seen -split ";" | Where-Object { $_ -match $ps7Pattern })
+        Note "PowerShell 7 module paths inherited" ($(if ($ps7Entries.Count -gt 0) { $ps7Entries -join "`n" } else { "none" }))
+        Check "the scenario is reproduced: Windows PowerShell 5.1 sees PowerShell 7's module paths" ($ps7Entries.Count -gt 0) $seen
         Check "install.ps1 exits 0 from cmd.exe inside PowerShell 7" ($nested.Out -match "EXIT=0") (Show $nested)
         Check "no cmdlet is missing" (-not ($nested.Out + $nested.Err).Contains("is not recognized")) (Show $nested)
         Check "the bootstrap checksum is verified and extraction follows" ($nested.Out -match "verifying checksum" -and $nested.Out -match "extracting") (Show $nested)
     }
+
+    # -- [12] Every alias from every shell ------------------------------------
+    Section "12 python, a minor line and manage-python from every shell"
+    $cmdMatrix = Invoke-Cmd "call python --version`ncall python$Other --version`ncall manage-python --status"
+    Check "cmd.exe: python runs $older" ($cmdMatrix.Out -match "Python $([regex]::Escape($older))") (Show $cmdMatrix)
+    Check "cmd.exe: python$Other runs $otherVersion" ($cmdMatrix.Out -match "Python $([regex]::Escape($otherVersion))") (Show $cmdMatrix)
+    Check "cmd.exe: manage-python --status" ($cmdMatrix.Out -match "manage-python $([regex]::Escape($Version))") (Show $cmdMatrix)
+    foreach ($shell in $Shells) {
+        $matrix = Invoke-PsDefault $shell.Exe "python --version; python$Other --version; manage-python --status; exit `$LASTEXITCODE"
+        Capture "every alias from $($shell.Name)" (Show $matrix)
+        Check "$($shell.Name): python runs $older" ($matrix.Out -match "Python $([regex]::Escape($older))") (Show $matrix)
+        Check "$($shell.Name): python$Other runs $otherVersion" ($matrix.Out -match "Python $([regex]::Escape($otherVersion))") (Show $matrix)
+        Check "$($shell.Name): manage-python --status exits 0" ($matrix.Code -eq 0 -and $matrix.Out -match "manage-python $([regex]::Escape($Version))") (Show $matrix)
+    }
+
+    # -- [13] Aliases written as .ps1 by 1.0.2 and earlier are removed ---------
+    Section "13 Files written by 1.0.2 for PowerShell are retired"
+    $legacy = "#`n# source`n#   project: osat-manager-python`n#   path: scripts/windows/alias.ps1.template`n# generated`n#   path: %LOCALAPPDATA%\Programs\python.ps1`n#   by: manage-python.py`n#`n"
+    Write-Text (Join-Path $Programs "python.ps1") $legacy -Crlf
+    # After section 9's rename the switched line's alias is py312.
+    Write-Text (Join-Path $Programs "py312.ps1") "& py.exe @args`n" -Crlf
+    $r = Manage "--switch $newest"
+    Capture "--switch $newest with old .ps1 aliases present" (Show $r)
+    Check "--switch removes a .ps1 alias the manager wrote" ($r.Code -eq 0 -and -not (Test-Path (Join-Path $Programs "python.ps1"))) (Show $r)
+    Check "--switch leaves a .ps1 it did not write, with a warning" ((Test-Path (Join-Path $Programs "py312.ps1")) -and $r.Err.Contains("PowerShell runs it instead")) (Show $r)
+    Remove-Item (Join-Path $Programs "py312.ps1")
+
+    # 1.0.2 also wrote the pointer as python-manager.env.ps1, and its .ps1
+    # aliases read an operator env.ps1. The pointer copy is deleted; the
+    # operator's env.ps1 is left, with a warning shown once.
+    $oldPointer = Join-Path $Share "python-manager.env.ps1"
+    $operatorPs1 = Join-Path $OperatorDir "env.ps1"
+    Write-Text $oldPointer "# %LOCALAPPDATA%\python-manager\python-manager.env.ps1`n# Generated by manage-python.py. Read by the aliases at runtime.`n" -Crlf
+    New-Item -ItemType Directory -Path $OperatorDir -Force | Out-Null
+    Write-Text $operatorPs1 "`$env:OSAT_EXAMPLE = 'set by the operator'`n" -Crlf
+    $r = Manage "--switch $older"
+    Capture "--switch $older with the 1.0.2 pointer and an operator env.ps1 present" (Show $r)
+    Check "--switch deletes the pointer's .ps1 copy" ($r.Code -eq 0 -and -not (Test-Path $oldPointer)) (Show $r)
+    Check "the operator's env.ps1 is left in place" (Test-Path $operatorPs1)
+    Check "a warning says env.ps1 is no longer read" ($r.Err.Contains("is no longer read")) (Show $r)
+    $again = Manage "--switch $newest"
+    Check "the warning is shown once" ($again.Code -eq 0 -and -not $again.Err.Contains("is no longer read")) (Show $again)
+    Remove-Item $operatorPs1
 }
 catch {
     Check "the validation script ran to the end" $false ($_ | Out-String)
@@ -511,8 +567,8 @@ finally {
   M2  cmd.exe, python REPL, Ctrl+C at the prompt, then Ctrl+C during: python -c "import time; time.sleep(30)"
       Is "Terminate batch job (Y/N)?" shown? What happens after answering?
       result:
-  M3  Windows PowerShell 5.1, same two Ctrl+C tests with python.ps1 (by full path if the .cmd is picked);
-      afterwards: Get-ChildItem Env:PYTHON_MANAGER* (should list nothing)
+  M3  Windows PowerShell 5.1, then PowerShell 7: the same two Ctrl+C tests, calling python by name (the .cmd alias).
+      Is "Terminate batch job (Y/N)?" shown? Does the PowerShell prompt come back normally afterwards?
       result:
   M4  rundll32 sysdm.cpl,EditEnvironmentVariables  opens, and user Path shows %LOCALAPPDATA%\Programs first
       result:

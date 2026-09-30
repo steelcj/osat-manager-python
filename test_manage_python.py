@@ -134,9 +134,8 @@ class TestPaths(Scratch):
     def test_windows_pointer_is_local_not_roaming(self):
         paths = self.windows_paths()
         local = self.home / "AppData" / "Local"
-        self.assertEqual(paths.pointer_files, {
-            "cmd": local / "python-manager" / "python-manager.env.cmd",
-            "ps1": local / "python-manager" / "python-manager.env.ps1"})
+        self.assertEqual(paths.pointer_files,
+                         {"cmd": local / "python-manager" / "python-manager.env.cmd"})
         self.assertEqual(paths.operator_env,
                          self.home / "AppData" / "Roaming" / "python-manager" / "env.cmd")
         self.assertEqual(paths.bin_dir, local / "Programs")
@@ -145,7 +144,10 @@ class TestPaths(Scratch):
     def test_alias_files_per_platform(self):
         self.assertEqual([f for _, f in self.posix_paths().alias_files("python")], ["posix"])
         self.assertEqual([p.name for p, _ in self.windows_paths().alias_files("python3.12")],
-                         ["python3.12.cmd", "python3.12.ps1"])
+                         ["python3.12.cmd"])
+        self.assertEqual([p.name for p in self.windows_paths().legacy_alias_files("python3.12")],
+                         ["python3.12.ps1"])
+        self.assertEqual(self.posix_paths().legacy_alias_files("python3.12"), [])
 
     def test_display(self):
         self.assertEqual(self.posix_paths().display(self.home / ".local/bin/python3.12"),
@@ -255,30 +257,30 @@ class TestPointerFormats(Scratch):
         self.assertIn("# " + tilde(".config", "python-manager", "python-manager.env") + "\n", text)
         self.assertIn("never touches", text)
 
-    def test_cmd_and_ps1_syntax(self):
+    def test_cmd_syntax(self):
         paths = self.windows_paths()
         cmd = mp.render_pointer(self.record(), "cmd", paths)
-        ps1 = mp.render_pointer(self.record(), "ps1", paths)
         self.assertIn('set "PYTHON_MANAGER_3_12=3.12.14"\n', cmd)
-        self.assertIn('$env:PYTHON_MANAGER_3_12 = "3.12.14"\n', ps1)
         self.assertTrue(cmd.startswith("rem %LOCALAPPDATA%"))
-        self.assertTrue(ps1.startswith("# %LOCALAPPDATA%"))
+        self.assertIn("rem Operator environment belongs in %APPDATA%", cmd)
+
+    def test_no_powershell_pointer_format(self):
+        self.assertEqual(sorted(mp._POINTER_FORMAT), ["cmd", "posix"])
 
     def test_round_trip_every_format(self):
         paths = self.windows_paths()
-        for fmt in ("posix", "cmd", "ps1"):
+        for fmt in ("posix", "cmd"):
             with self.subTest(fmt=fmt):
                 text = mp.render_pointer(self.record(), fmt, paths)
                 self.assertEqual(mp.parse_pointer(text, fmt), self.record())
                 crlf = text.replace("\n", "\r\n")
                 self.assertEqual(mp.parse_pointer(crlf, fmt), self.record())
 
-    def test_three_formats_carry_same_keys_and_values(self):
+    def test_both_formats_carry_same_keys_and_values(self):
         paths = self.windows_paths()
         parsed = [mp.parse_pointer(mp.render_pointer(self.record(), f, paths), f).to_items()
-                  for f in ("posix", "cmd", "ps1")]
+                  for f in ("posix", "cmd")]
         self.assertEqual(parsed[0], parsed[1])
-        self.assertEqual(parsed[1], parsed[2])
 
     def test_parse_tolerates_comments_bom_and_case(self):
         text = '﻿@echo off\nrem hello\n:: note\nREM\nSET "python_manager_3_12=3.12.1"\n'
@@ -327,9 +329,10 @@ class TestPointerFormats(Scratch):
         self.assertEqual(os.listdir(paths.pointer_dir), ["python-manager.env"])
         self.assertEqual(mp.read_pointer(paths), self.record())
 
-    def test_windows_write_produces_both_files_with_crlf(self):
+    def test_windows_write_produces_one_cmd_file_with_crlf(self):
         paths = self.windows_paths()
         mp.write_pointer(self.record(), paths)
+        self.assertEqual(sorted(os.listdir(paths.pointer_dir)), ["python-manager.env.cmd"])
         for path in paths.pointer_files.values():
             raw = path.read_bytes()
             self.assertIn(b"\r\n", raw)
@@ -804,15 +807,8 @@ class TestAliasRendering(Scratch):
         self.assertIn("if not defined PYTHON_MANAGER_3_12 goto :unset\n", cmd)
         self.assertLess(cmd.index("python-manager.env.cmd"), cmd.index("env.cmd\" call"))
 
-        ps1 = mp.render_alias(mp.read_template("ps1"), "#",
-                              r"%LOCALAPPDATA%\Programs\python3.12.ps1", "PYTHON_MANAGER_3_12")
-        self.assertIn("#   by: manage-python.py\n", ps1)
-        self.assertIn(r"\$env:PYTHON_MANAGER_3_12\python\python.exe" + '" @args', ps1)
-        self.assertIn("$osatExit = $LASTEXITCODE", ps1)
-        self.assertTrue(ps1.endswith("}\nexit $osatExit\n"))
-        self.assertLess(ps1.index("$osatSnapshot = @{}"), ps1.index("python-manager.env.ps1"))
-        self.assertLess(ps1.index("python-manager.env.ps1"), ps1.index('env.ps1") {'))
-        self.assertLess(ps1.index("finally {"), ps1.index("exit $osatExit"))
+        self.assertEqual(sorted(mp.ALIAS_TEMPLATES), ["cmd", "posix"])
+        self.assertEqual(sorted(mp.MANAGER_ALIAS_TEMPLATES), ["cmd", "posix"])
 
     def test_generic_alias_reads_default_key(self):
         text = mp.render_alias(mp.read_template("posix"), "#", "~/.local/bin/python",
@@ -840,7 +836,7 @@ class TestAliasOwnership(Scratch):
 
     def test_ours_every_format(self):
         paths = self.windows_paths()
-        for fmt, comment in (("posix", "#"), ("cmd", "rem"), ("ps1", "#")):
+        for fmt, comment in (("posix", "#"), ("cmd", "rem")):
             text = mp.render_alias(mp.read_template(fmt), comment, "p", "PYTHON_MANAGER_3_12")
             with self.subTest(fmt=fmt):
                 self.assertEqual(mp.alias_owner(self.write(fmt, text)), "ours")
@@ -906,23 +902,22 @@ class TestWriteAlias(Scratch):
         with self.assertRaisesRegex(mp.ManagerError, "--alias python=<new-name>"):
             mp.write_alias(paths, mp.DEFAULT, "python")
 
-    def test_windows_pair_written_with_crlf(self):
+    def test_windows_alias_is_one_cmd_file_with_crlf(self):
         paths = self.windows_paths()
         written = mp.write_alias(paths, mp.DEFAULT, "python")
-        self.assertEqual([p.name for p in written], ["python.cmd", "python.ps1"])
-        for path in written:
-            raw = path.read_bytes()
-            self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
-            self.assertEqual(mp.alias_owner(path), "ours")
-        self.assertIn(b"%PYTHON_MANAGER_DEFAULT%", written[0].read_bytes())
+        self.assertEqual([p.name for p in written], ["python.cmd"])
+        raw = written[0].read_bytes()
+        self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
+        self.assertEqual(mp.alias_owner(written[0]), "ours")
+        self.assertIn(b"%PYTHON_MANAGER_DEFAULT%", raw)
 
-    def test_windows_foreign_ps1_blocks_both_files(self):
+    def test_windows_foreign_cmd_blocks_the_alias(self):
         paths = self.windows_paths()
         paths.bin_dir.mkdir(parents=True)
-        (paths.bin_dir / "python.ps1").write_text("& py.exe @args\n")
-        with self.assertRaises(mp.ManagerError):
+        (paths.bin_dir / "python.cmd").write_text("@py.exe %*\n")
+        with self.assertRaisesRegex(mp.ManagerError, "--alias python=<new-name>"):
             mp.write_alias(paths, mp.DEFAULT, "python")
-        self.assertFalse((paths.bin_dir / "python.cmd").exists())
+        self.assertEqual((paths.bin_dir / "python.cmd").read_text(), "@py.exe %*\n")
 
     def test_refuses_bad_names(self):
         with self.assertRaises(mp.ManagerError):
@@ -991,7 +986,7 @@ class TestSelfPointer(Scratch):
 
     def test_self_keys_round_trip_in_every_format(self):
         paths = self.windows_paths()
-        for fmt in ("posix", "cmd", "ps1"):
+        for fmt in ("posix", "cmd"):
             with self.subTest(fmt=fmt):
                 text = mp.render_pointer(self.record(), fmt, paths)
                 self.assertEqual(mp.parse_pointer(text, fmt), self.record())
@@ -1039,10 +1034,6 @@ class TestManagerAlias(Scratch):
                       r'"%LOCALAPPDATA%\python-manager\manage-python\%PYTHON_MANAGER_SELF%'
                       r'\manage-python.py" %*', cmd)
         self.assertIn("if not defined PYTHON_MANAGER_SELF goto :unset", cmd)
-        ps1 = mp.render_alias(mp.read_template("ps1", slot=mp.SELF), "#", "p", "PYTHON_MANAGER_SELF")
-        self.assertIn(r'\manage-python\$env:PYTHON_MANAGER_SELF\manage-python.py" @args', ps1)
-        self.assertIn("finally {", ps1)
-        self.assertTrue(ps1.endswith("exit $osatExit\n"))
 
     def test_write_alias_uses_manager_template(self):
         paths = self.posix_paths()
@@ -1072,117 +1063,6 @@ class TestManagerAlias(Scratch):
         result = subprocess.run([str(alias)], env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PYTHON_MANAGER_SELF", result.stderr)
-
-
-def real_runtime(root):
-    """A runtime directory whose python.exe really starts.
-
-    Rule for every test that launches a runtime: on Windows, never a stand-in
-    script named .exe. Windows cannot run one, and may show an "Unsupported
-    16-Bit Application" dialog. On Windows this copies the running
-    interpreter's python.exe and its DLLs, and returns the PYTHONHOME that
-    points the copy at the running interpreter's standard library. Elsewhere
-    a script that runs the current interpreter serves, since POSIX runs
-    scripts whatever their name. Returns (python.exe path, PYTHONHOME or None)."""
-    exe = root / "python" / "python.exe"
-    exe.parent.mkdir(parents=True)
-    if os.name != "nt":
-        exe.write_text('#!/bin/sh\nexec "{}" "$@"\n'.format(sys.executable))
-        exe.chmod(0o700)
-        return exe, None
-    base = Path(sys.base_prefix)
-    source = base / "python.exe"
-    if not source.is_file():
-        raise unittest.SkipTest(f"no python.exe in {base} to copy")
-    try:
-        shutil.copyfile(source, exe)
-        for dll in list(base.glob("python*.dll")) + list(base.glob("vcruntime*.dll")):
-            shutil.copyfile(dll, exe.parent / dll.name)
-    except OSError as error:                        # e.g. a Microsoft Store Python
-        raise unittest.SkipTest(f"cannot copy the running interpreter: {error}")
-    assert exe.read_bytes()[:2] == b"MZ", "a Windows test would launch a non-executable"
-    return exe, str(base)
-
-
-@unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed")
-class TestPowerShellAliasRestoresEnvironment(Scratch):
-    """The .ps1 alias must leave the calling session's environment as it was,
-    whether the runtime exits 0, exits with an error code, or fails to start.
-    A start failure is tried twice: caught, and uncaught so PowerShell
-    formats the error, as in the first Windows run. Each case prints the
-    variables that differ, so a failure says what changed."""
-
-    CASES = ("ok", "seven", "missing_caught", "missing_uncaught")
-
-    def run_session(self):
-        paths = self.windows_paths()
-        local = self.home / "AppData" / "Local"
-        roaming = self.home / "AppData" / "Roaming"
-        exe, python_home = real_runtime(paths.runtime_dir("3.12.14"))
-        mp.write_pointer(mp.PointerRecord(default="3.12.14", lines={"3.12": "3.12.14"}), paths)
-        paths.config_dir.mkdir(parents=True)
-        # The operator environment changes one variable and adds one; for the
-        # start-failure cases it points the alias at a version that is not
-        # installed, so python.exe is missing.
-        (paths.config_dir / "env.ps1").write_text(
-            '$env:OSAT_KEEP = "changed-by-operator"\n'
-            '$env:OSAT_ADDED = "added-by-operator"\n'
-            'if ($env:OSAT_CASE -like "missing*") { $env:PYTHON_MANAGER_3_12 = "3.12.99" }\n')
-        [_cmd, ps1] = mp.write_alias(paths, "3.12", "python3.12")
-        home_line = f"$env:PYTHONHOME = '{python_home}'" if python_home else ""
-        session = self.tmp / "session.ps1"
-        session.write_text(f"""
-$env:LOCALAPPDATA = '{local}'
-$env:APPDATA = '{roaming}'
-$env:OSAT_KEEP = 'before'
-{home_line}
-$alias = '{ps1}'
-function Snap {{ (Get-ChildItem Env: | Sort-Object Name | ForEach-Object {{ "$($_.Name)=$($_.Value)" }}) -join "`n" }}
-function Report($case, $before) {{
-    $after = Snap
-    if ($before -ceq $after) {{ "ENV_$case=unchanged" }} else {{
-        "ENV_$case=changed"
-        Compare-Object ($before -split "`n") ($after -split "`n") |
-            ForEach-Object {{ "DIFF_$case $($_.SideIndicator) $($_.InputObject)" }}
-    }}
-}}
-
-$env:OSAT_CASE = 'ok'
-$before = Snap
-& $alias -c "import sys; print('runtime', *sys.argv[1:])" first second
-"CODE_ok=$LASTEXITCODE"
-Report 'ok' $before
-
-$env:OSAT_CASE = 'seven'
-$before = Snap
-& $alias -c "import sys; sys.exit(7)"
-"CODE_seven=$LASTEXITCODE"
-Report 'seven' $before
-
-$env:OSAT_CASE = 'missing_caught'
-$before = Snap
-try {{ & $alias --version }} catch {{ "START_FAILED=$($_.Exception.GetType().Name)" }}
-Report 'missing_caught' $before
-
-$env:OSAT_CASE = 'missing_uncaught'
-$before = Snap
-& $alias --version
-Report 'missing_uncaught' $before
-""", encoding="utf-8")
-        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                               "-File", str(session)], capture_output=True, text=True, timeout=180)
-
-    def test_environment_is_restored_on_every_path(self):
-        result = self.run_session()
-        lines = result.stdout.splitlines()
-        detail = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        self.assertIn("runtime first second", lines, detail)
-        self.assertIn("CODE_ok=0", lines, detail)
-        self.assertIn("CODE_seven=7", lines, detail)
-        self.assertTrue(any(line.startswith("START_FAILED=") for line in lines), detail)
-        for case in self.CASES:
-            with self.subTest(case=case):
-                self.assertIn(f"ENV_{case}=unchanged", lines, detail)
 
 
 # ── Lifecycle fixtures ────────────────────────────────────────────────────────
@@ -1615,9 +1495,8 @@ class TestInstall(Lifecycle):
         runtime = paths.runtime_dir("3.12.14")
         self.assertTrue((runtime / "python" / "Lib" / "EXTERNALLY-MANAGED").is_file())
         self.assertTrue(all(p.is_file() for p in paths.pointer_files.values()))
-        self.assertEqual(sorted(os.listdir(paths.bin_dir)), [
-            "manage-python.cmd", "manage-python.ps1", "python.cmd", "python.ps1",
-            "python3.12.cmd", "python3.12.ps1"])
+        self.assertEqual(sorted(os.listdir(paths.bin_dir)),
+                         ["manage-python.cmd", "python.cmd", "python3.12.cmd"])
 
     def test_path_notes(self):
         self.env["PATH"] = "/usr/bin"
@@ -2492,6 +2371,180 @@ class TestRepositoryTracksNothingIgnored(unittest.TestCase):
         text = (_SCRIPT.parent / "publish-release.py").read_text(encoding="utf-8")
         self.assertLess(text.index("    refuse_if_ignored_files_tracked(tag)"),
                         text.index("    first = build_tarball(tag, repo, version)"))
+
+# ── Windows: .cmd aliases only, earlier .ps1 aliases cleaned up ───────────────
+
+LEGACY_PS1 = ("#\n# source\n#   project: osat-manager-python\n#   path: scripts/windows/alias.ps1.template\n"
+              "# generated\n#   path: %LOCALAPPDATA%\\Programs\\{name}.ps1\n#   by: manage-python.py\n#\n"
+              "$osatSnapshot = @{{}}\n")
+
+
+class TestLegacyPowerShellAliases(Lifecycle):
+    """Up to 1.0.2 each Windows alias also had a .ps1 twin, which Windows
+    PowerShell 5.1's default policy blocks and which PowerShell prefers over
+    the .cmd. --install, --switch and --alias remove the ones the manager
+    wrote, identified by the by: line, and leave any other .ps1 in place with
+    a warning, since PowerShell would run it instead of the alias."""
+
+    TRIPLE = "x86_64-pc-windows-msvc"
+
+    def setUp(self):
+        super().setUp()
+        self.wpaths = self.windows_paths()
+        self.publish("3.12.13+20260801", windows=True, triple=self.TRIPLE)
+        self.publish("3.12.14+20260924", windows=True, triple=self.TRIPLE)
+
+    def install_windows(self, spec):
+        return mp.cmd_install(spec, self.wpaths, self.net, triple=self.TRIPLE,
+                              source_dir=self.source, now=self.NOW)
+
+    def plant(self, *names, foreign=()):
+        self.wpaths.bin_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (self.wpaths.bin_dir / f"{name}.ps1").write_text(LEGACY_PS1.format(name=name))
+        for name in foreign:
+            (self.wpaths.bin_dir / f"{name}.ps1").write_text("& py.exe @args\n")
+
+    def ps1_files(self):
+        return sorted(p.name for p in self.wpaths.bin_dir.glob("*.ps1"))
+
+    def test_install_removes_the_old_ps1_aliases(self):
+        self.plant("python", "python3.12", "manage-python")
+        self.assertEqual(mp.alias_owner(self.wpaths.bin_dir / "python.ps1"), "ours")
+        self.install_windows("3.12.14+20260924")
+        self.assertEqual(self.ps1_files(), [])
+        self.assertEqual(sorted(os.listdir(self.wpaths.bin_dir)),
+                         ["manage-python.cmd", "python.cmd", "python3.12.cmd"])
+        self.assertIn("removed %LOCALAPPDATA%", self.err.getvalue())
+
+    def test_switch_removes_the_old_ps1_aliases(self):
+        self.install_windows("3.12.13+20260801")
+        self.install_windows("3.12.14+20260924")
+        self.plant("python", "python3.12")
+        mp.cmd_switch("3.12.13", self.wpaths)
+        self.assertEqual(self.ps1_files(), [])
+
+    def test_a_foreign_ps1_is_left_with_a_warning(self):
+        self.plant("python3.12", foreign=["python"])
+        self.install_windows("3.12.14+20260924")
+        self.assertEqual(self.ps1_files(), ["python.ps1"])
+        self.assertEqual((self.wpaths.bin_dir / "python.ps1").read_text(), "& py.exe @args\n")
+        self.assertIn("PowerShell runs it instead of the python alias", self.err.getvalue())
+
+    def test_rename_and_remove_take_the_old_ps1_too(self):
+        self.install_windows("3.12.13+20260801")
+        self.install_windows("3.12.14+20260924")
+        self.plant("python3.12")
+        mp.cmd_alias("python3.12=py312", self.wpaths)
+        self.assertEqual(self.ps1_files(), [])
+        self.plant("py312")
+        mp.cmd_remove("3.12.13", self.wpaths)                      # not the line's last version
+        self.assertEqual(self.ps1_files(), ["py312.ps1"])
+        mp.cmd_switch("3.12.14", self.wpaths)
+        self.assertEqual(self.ps1_files(), [])
+
+
+class TestExternallyManagedMessage(unittest.TestCase):
+    """pip reads EXTERNALLY-MANAGED with configparser and prints the Error
+    value line by line; the first Windows run showed a stray "." line."""
+
+    def message(self, minor="3.12"):
+        import configparser
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(mp.EXTERNALLY_MANAGED.format(minor=minor))
+        return parser["externally-managed"]["Error"].splitlines()
+
+    def test_no_stray_or_blank_lines(self):
+        lines = self.message()
+        self.assertTrue(lines)
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertNotIn(line.strip(), ("", "."))
+
+    def test_names_the_venv_command(self):
+        self.assertEqual(self.message("3.13")[-1], "python3.13 -m venv .venv")
+
+    def test_written_into_the_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stdlib = Path(tmp)
+            mp.write_externally_managed(stdlib, "3.12.14", windows=False)
+            text = (stdlib / "EXTERNALLY-MANAGED").read_text(encoding="utf-8")
+        self.assertEqual(text, mp.EXTERNALLY_MANAGED.format(minor="3.12"))
+
+
+# ── Windows: the pointer is .cmd only; env.ps1 is no longer read ──────────────
+
+LEGACY_POINTER_PS1 = ("# %LOCALAPPDATA%\\python-manager\\python-manager.env.ps1\n"
+                      "# Generated by manage-python.py. Read by the aliases at runtime.\n"
+                      '$env:PYTHON_MANAGER_DEFAULT = "3.12.13"\n')
+
+
+class TestLegacyWindowsPointer(Lifecycle):
+    """Up to 1.0.2 the manager also wrote python-manager.env.ps1 and its .ps1
+    aliases read the operator's env.ps1. Every changing command deletes the
+    pointer copy the manager wrote; the operator's env.ps1 is left in place,
+    with a warning shown once, since it is no longer read."""
+
+    TRIPLE = "x86_64-pc-windows-msvc"
+
+    def setUp(self):
+        super().setUp()
+        self.wpaths = self.windows_paths()
+        self.old_pointer = self.wpaths.pointer_dir / "python-manager.env.ps1"
+        self.operator_ps1 = self.wpaths.config_dir / "env.ps1"
+        for label in ("3.12.13+20260801", "3.12.14+20260924"):
+            self.publish(label, windows=True, triple=self.TRIPLE)
+
+    def install_windows(self, spec):
+        return mp.cmd_install(spec, self.wpaths, self.net, triple=self.TRIPLE,
+                              source_dir=self.source, now=self.NOW)
+
+    def plant_pointer(self, text=LEGACY_POINTER_PS1):
+        self.wpaths.pointer_dir.mkdir(parents=True, exist_ok=True)
+        self.old_pointer.write_text(text)
+
+    def test_install_writes_only_the_cmd_pointer_and_deletes_the_old_one(self):
+        self.plant_pointer()
+        self.install_windows("3.12.14+20260924")
+        self.assertFalse(self.old_pointer.exists())
+        self.assertTrue(self.wpaths.pointer_file.is_file())
+        self.assertIn("the pointer is now python-manager.env.cmd only", self.err.getvalue())
+
+    def test_switch_alias_and_remove_delete_the_old_pointer(self):
+        self.install_windows("3.12.13+20260801")
+        self.install_windows("3.12.14+20260924")
+        for command in (lambda: mp.cmd_switch("3.12.13", self.wpaths),
+                        lambda: mp.cmd_alias("python=py", self.wpaths),
+                        lambda: mp.cmd_remove("3.12.14", self.wpaths)):
+            self.plant_pointer()
+            command()
+            self.assertFalse(self.old_pointer.exists())
+
+    def test_a_pointer_ps1_it_did_not_write_is_left(self):
+        self.plant_pointer("# someone else's file\n")
+        self.install_windows("3.12.14+20260924")
+        self.assertTrue(self.old_pointer.exists())
+        self.assertIn("was not written by manage-python; left in place", self.err.getvalue())
+
+    def test_operator_env_ps1_is_left_and_warned_about_once(self):
+        self.operator_ps1.parent.mkdir(parents=True, exist_ok=True)
+        self.operator_ps1.write_text('$env:HTTPS_PROXY = "http://proxy:8080"\n')
+        self.install_windows("3.12.13+20260801")
+        first = self.err.getvalue()
+        self.assertIn("env.ps1 is no longer read", first)
+        self.assertIn("env.cmd", first)
+        self.install_windows("3.12.14+20260924")
+        mp.cmd_switch("3.12.13", self.wpaths)
+        self.assertEqual(self.err.getvalue().count("is no longer read"), 1)
+        self.assertTrue(self.operator_ps1.is_file())
+        self.assertTrue((self.wpaths.state_dir / mp.ENV_PS1_NOTICE).is_file())
+
+    def test_nothing_happens_on_posix(self):
+        self.publish("3.12.14+20260924")
+        mp.cmd_install("3.12.14+20260924", self.paths, self.net, triple=TRIPLE,
+                       source_dir=self.source, now=self.NOW)
+        self.assertNotIn("no longer read", self.err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

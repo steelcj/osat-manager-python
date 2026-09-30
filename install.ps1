@@ -86,8 +86,7 @@ if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ManagePy = Join-Path $ScriptDir "manage-python.py"
 foreach ($Required in @("manage-python.py", "VERSION", "scripts\windows\alias.cmd.template",
-                        "scripts\windows\alias.ps1.template", "scripts\windows\manager-alias.cmd.template",
-                        "scripts\windows\manager-alias.ps1.template")) {
+                        "scripts\windows\manager-alias.cmd.template")) {
     if (-not (Test-Path (Join-Path $ScriptDir $Required))) {
         Fail "$Required not found next to this script in $ScriptDir. Download the full release, not just this file."
     }

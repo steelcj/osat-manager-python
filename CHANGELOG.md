@@ -9,7 +9,7 @@ N` file and the git tags. Dates are ISO 8601.
 
 ### Fixed
 
-- `install.ps1` failed with "Get-FileHash is not recognized" when Windows PowerShell 5.1 was started from a Command Prompt opened inside PowerShell 7: 5.1 inherits PowerShell 7's `PSModulePath` and cannot load `Get-FileHash`, a script-defined cmdlet. It now computes the SHA-256 with .NET. Found on the Windows 11 VM.
+- `install.ps1` failed with "Get-FileHash is not recognized" when Windows PowerShell 5.1 was started from a Command Prompt opened inside PowerShell 7: 5.1 inherits PowerShell 7's `PSModulePath` and cannot load `Get-FileHash`, a script-defined cmdlet. It now computes the SHA-256 with .NET. Found on the Windows 11 VM. Verified on the Windows 11 VM: `install.ps1` completed with PowerShell 7's module paths inherited, the Store install's among them.
 
 - Release archives no longer contain `.claude/` (session logs and assistant notes). They were in the 1.0.0 and 1.0.2 archives because those files were tracked, and `git archive`, which `publish-release.py` uses, packages every tracked file; `.gitignore` does not affect files that are already tracked. `.claude/` is no longer tracked (the files stay on disk; the root `CLAUDE.md` stays tracked), and `publish-release.py` now refuses to package a tag in which any tracked file matches `.gitignore`, naming the files, with a test in `test_publish_release.py`.
 
@@ -19,9 +19,11 @@ N` file and the git tags. Dates are ISO 8601.
 
 - The test suite runs on Windows: path separators, file encodings and symbolic links are handled portably, and on Windows the install tests read the version their stand-in interpreter scripts would print, since Windows cannot run them.
 
-- The `.ps1` aliases restore the session environment through PowerShell's `Env:` provider (`Remove-Item`, `Set-Item`) instead of `[Environment]::SetEnvironmentVariable`, to which PowerShell passes `$null` as an empty string, leaving deletion to the .NET version underneath. The PowerShell test now covers four paths, each printing the variables that differ: the runtime exits 0, exits 7, fails to start with the error caught, and fails to start uncaught. On Windows it runs a copy of the real interpreter rather than a stand-in script named `python.exe`, which Windows cannot run and which raised an "Unsupported 16-Bit Application" dialog.
-
 - The refusal to run as Administrator is tested on every platform, with a stand-in for `IsUserAnAdmin`.
+
+- pip printed a line containing only "." in the message from `EXTERNALLY-MANAGED`, because pip reads the file with configparser, which keeps a continuation line of "." as text. The message now has no spacer line, and a test reads it the way pip does.
+
+- `validate-windows.ps1` section 11 reported that PowerShell 7's module paths were not inherited when they were: it looked for `\PowerShell\7\` only. It now recognises `\PowerShell\Modules`, `\PowerShell\7\Modules` and the Store install's `microsoft.powershell_<version>\Modules`, and fails if the scenario is not reproduced.
 
 ### Added
 
@@ -29,8 +31,17 @@ N` file and the git tags. Dates are ISO 8601.
 
 ### Changed
 
+- Windows aliases are `.cmd` files only. The 1.0.2 validation on Windows 11 showed that Windows PowerShell 5.1's default execution policy (Restricted) blocks the `.ps1` alias, that PowerShell picks `python3.12.ps1` over `python3.12.cmd` when both exist, and that it does not fall back to the `.cmd`, so `python3.12` failed in a default PowerShell session. A `.cmd` alias runs from `cmd.exe`, Windows PowerShell 5.1 and PowerShell 7 alike, in its own `cmd.exe` process, so the `.ps1` templates and their environment snapshot-and-restore are gone. `--install`, `--switch` and `--alias` remove the `.ps1` aliases 1.0.2 wrote, recognised by their `by:` line; a `.ps1` of the same name that the manager did not write is left in place with a warning, since PowerShell would run it instead of the alias.
+
+- On Windows the pointer is `python-manager.env.cmd` only and the operator environment is `env.cmd` only, since every alias is a `.cmd` file. `--install`, `--switch`, `--alias` and `--remove` delete the `python-manager.env.ps1` an earlier version wrote, recognised by its header. An operator `%APPDATA%\python-manager\env.ps1` is left in place, with a warning, shown once, that it is no longer read and that its settings belong in `env.cmd`.
+
+- `en/docs/python-tool-README-v3.md`, the 0.2.0 documentation, is removed; it remains in the git history and in the 0.2.0 release.
+
+- `validate-windows.ps1` checks the `.cmd` aliases from `cmd.exe`, Windows PowerShell 5.1 and PowerShell 7 under the default execution policy, including argument pass-through and exit codes through the `.cmd` layer, notes what `cmd.exe` does to `%` and `^` in arguments, checks the pip message, and checks that `.ps1` aliases left by 1.0.2 are removed. The Windows validation instructions are at 0.3.0.
+
 - `validate-windows.ps1` reads the Windows version from the registry instead of `Get-CimInstance`, for the same reason, and adds section 11: `install.ps1` run from a Command Prompt opened inside PowerShell 7. The Windows validation instructions are at 0.2.0, with manual step M6 for machines without PowerShell 7.
-- A unit test keeps `install.ps1`, `validate-windows.ps1` and the `.ps1` alias templates to cmdlets built into Windows PowerShell 5.1.
+
+- A unit test keeps `install.ps1` and `validate-windows.ps1` to cmdlets built into Windows PowerShell 5.1.
 
 ## [1.0.2] - 2026-09-29
 
