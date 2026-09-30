@@ -1,3 +1,0 @@
-# Release archives: git archive leaves these out. They stay tracked in the
-# repository, but session logs and assistant notes are not part of a release.
-/.claude export-ignore

@@ -2300,64 +2300,32 @@ class TestPowerShellScriptsNeedNoModulePath(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("git") and (_SCRIPT.parent / ".git").exists(),
                      "needs git and a git checkout")
-class TestReleaseArchive(unittest.TestCase):
-    """publish-release.py builds release archives with git archive, so they
-    hold tracked files only; .gitignore cannot remove files that are already
-    tracked. .gitattributes marks .claude export-ignore, so session logs and
-    assistant notes stay tracked but never ship. This builds an archive with
-    publish-release.py's own build_tarball from a scratch clone, with the
-    working tree's .gitattributes committed there, so nothing is written to
-    this repository."""
+class TestRepositoryTracksNothingIgnored(unittest.TestCase):
+    """Release archives are built with git archive, which packages every
+    tracked file; .gitignore cannot remove a file that is already tracked.
+    So nothing tracked may match .gitignore: .claude/ (session logs and
+    assistant notes) stays local, while the root CLAUDE.md is tracked.
+    publish-release.py refuses a tag that breaks this, and
+    test_publish_release.py tests that refusal. These checks only read the
+    repository's index."""
 
     def git(self, *args):
-        return subprocess.run(["git", "-C", str(self.clone), "-c", "user.name=test",
-                               "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
-                               *args], capture_output=True, text=True, check=True).stdout
+        return subprocess.run(["git", "-C", str(_SCRIPT.parent), *args],
+                              capture_output=True, text=True, check=True).stdout
 
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="manage-python-archive-"))
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.clone = self.tmp / "clone"
-        subprocess.run(["git", "clone", "-q", "--no-hardlinks", str(_SCRIPT.parent), str(self.clone)],
-                       capture_output=True, check=True)
-        shutil.copyfile(_SCRIPT.parent / ".gitattributes", self.clone / ".gitattributes")
-        self.git("add", ".gitattributes")
-        if self.git("status", "--porcelain").strip():
-            self.git("commit", "-q", "-m", "gitattributes from the working tree")
-        # Untracked files, ignored and not, must never reach an archive either.
-        (self.clone / ".claude" / "logs").mkdir(parents=True, exist_ok=True)
-        (self.clone / ".claude" / "logs" / "untracked-session.md").write_text("x")
-        (self.clone / "dist").mkdir(exist_ok=True)
-        (self.clone / "dist" / "old.tar.gz").write_text("x")
-        (self.clone / "scratch-note.txt").write_text("x")
+    def test_no_tracked_file_matches_gitignore(self):
+        self.assertEqual(self.git("ls-files", "-ci", "--exclude-standard").split(), [])
 
-        spec = importlib.util.spec_from_file_location("publish_release", _SCRIPT.parent / "publish-release.py")
-        self.publish = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.publish)
-        self.publish._HERE = self.clone
-        data = self.publish.build_tarball("HEAD", "osat-manager-python", "0.0.0")
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            prefix = "osat-manager-python-0.0.0/"
-            self.files = {m.name[len(prefix):] for m in tar.getmembers() if m.isfile()}
-        self.tracked = set(self.git("ls-tree", "-r", "--name-only", "HEAD").split())
+    def test_claude_directory_is_not_tracked(self):
+        self.assertEqual(self.git("ls-files", "--", ".claude").split(), [])
 
-    def test_no_claude_directory(self):
-        self.assertEqual(sorted(f for f in self.files if f.startswith(".claude")), [])
+    def test_root_claude_md_is_tracked(self):
+        self.assertIn("CLAUDE.md", self.git("ls-files", "--", "CLAUDE.md").split())
 
-    def test_claude_files_stay_tracked(self):
-        self.assertTrue(any(f.startswith(".claude/") for f in self.tracked))
-
-    def test_only_tracked_files(self):
-        self.assertTrue(self.files)
-        self.assertEqual(sorted(self.files - self.tracked), [])
-        for untracked in ("scratch-note.txt", "dist/old.tar.gz", ".claude/logs/untracked-session.md"):
-            self.assertNotIn(untracked, self.files)
-
-    def test_everything_else_tracked_ships(self):
-        expected = {f for f in self.tracked if not f.startswith(".claude/")}
-        self.assertEqual(sorted(expected - self.files), [])
-        self.assertIn("manage-python.py", self.files)
-
+    def test_publish_release_checks_before_building(self):
+        text = (_SCRIPT.parent / "publish-release.py").read_text()
+        self.assertLess(text.index("    refuse_if_ignored_files_tracked(tag)"),
+                        text.index("    first = build_tarball(tag, repo, version)"))
 
 if __name__ == "__main__":
     unittest.main()

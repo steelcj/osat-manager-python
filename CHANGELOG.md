@@ -11,11 +11,11 @@ N` file and the git tags. Dates are ISO 8601.
 
 - `install.ps1` failed with "Get-FileHash is not recognized" when Windows PowerShell 5.1 was started from a Command Prompt opened inside PowerShell 7: 5.1 inherits PowerShell 7's `PSModulePath` and cannot load `Get-FileHash`, a script-defined cmdlet. It now computes the SHA-256 with .NET. Found on the Windows 11 VM.
 
-- Release archives no longer contain `.claude/` (session logs and assistant notes). They were in the 1.0.0 and 1.0.2 archives because those files are tracked, and `git archive`, which `publish-release.py` uses, packages every tracked file; `.gitignore` does not affect files that are already tracked. A new `.gitattributes` marks `/.claude` as `export-ignore`, so the files stay in the repository but leave release archives, and a test builds an archive to check it.
+- Release archives no longer contain `.claude/` (session logs and assistant notes). They were in the 1.0.0 and 1.0.2 archives because those files were tracked, and `git archive`, which `publish-release.py` uses, packages every tracked file; `.gitignore` does not affect files that are already tracked. `.claude/` is no longer tracked (the files stay on disk; the root `CLAUDE.md` stays tracked), and `publish-release.py` now refuses to package a tag in which any tracked file matches `.gitignore`, naming the files, with a test in `test_publish_release.py`.
 
 ### Added
 
-- The plain-language guide *Installing manage-python on Windows with Command Prompt*, version 0.1.1, in `en/docs/guides/`.
+- The plain-language guide *Installing manage-python on Windows with Command Prompt*, version 0.1.2, in `en/docs/guides/osat-manager-python/`.
 
 ### Changed
 

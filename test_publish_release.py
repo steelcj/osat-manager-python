@@ -194,6 +194,42 @@ def main():
         check(r.returncode != 0 and "no usable gpg" in r.stderr,
               "--sign with no key refuses", r.stderr)
 
+        # ── Refusal: a tracked file that matches .gitignore ──
+        # .gitignore cannot untrack a file, so git archive would ship it.
+        irepo = make_repo(Path(tempfile.mkdtemp(dir=root)))
+        (irepo / ".gitignore").write_text("notes/\n")
+        (irepo / "notes").mkdir()
+        (irepo / "notes" / "session.md").write_text("private\n")
+        sh(irepo, "git", "add", ".gitignore")
+        sh(irepo, "git", "add", "-f", "notes/session.md")
+        (irepo / "VERSION").write_text("0.1.1\n")
+        sh(irepo, "git", "commit", "-aqm", "0.1.1 with a tracked ignored file")
+        sh(irepo, "git", "tag", "-a", "v0.1.1", "-m", "version 0.1.1")
+        sh(irepo, "git", "push", "-q", "origin", "main", "v0.1.1")
+        r = publish(irepo, "--backend", "dir", "--target", str(root / "pi"),
+                    "--dry-run", "--no-sign")
+        check(r.returncode != 0 and "match .gitignore" in r.stderr
+              and "notes/session.md" in r.stderr and "git rm -r --cached" in r.stderr,
+              "a tracked file matching .gitignore refuses, naming it", r.stderr)
+        check(not (irepo / "dist" / "scratch-0.1.1.tar.gz").exists(),
+              "nothing is built when an ignored file is tracked")
+
+        # ── Once untracked, it stays out, though still on disk ──
+        sh(irepo, "git", "rm", "-r", "-q", "--cached", "notes")
+        (irepo / "VERSION").write_text("0.1.2\n")
+        sh(irepo, "git", "commit", "-aqm", "0.1.2 untracks notes/")
+        sh(irepo, "git", "tag", "-a", "v0.1.2", "-m", "version 0.1.2")
+        sh(irepo, "git", "push", "-q", "origin", "main", "v0.1.2")
+        r = publish(irepo, "--backend", "dir", "--target", str(root / "pi"),
+                    "--dry-run", "--no-sign")
+        check(r.returncode == 0, "publishes once the file is untracked", r.stderr)
+        with tarfile.open(irepo / "dist" / "scratch-0.1.2.tar.gz") as tf:
+            names = tf.getnames()
+        check((irepo / "notes" / "session.md").is_file()
+              and not any("notes" in n for n in names)
+              and "scratch-0.1.2/.gitignore" in names,
+              "untracked and ignored files never reach the archive")
+
         # ── Real signing with a throwaway key, when gpg is present ──
         if shutil.which("gpg"):
             gnupg = root / "gnupg"

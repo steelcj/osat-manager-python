@@ -1,6 +1,6 @@
 ---
 dc:title: "Installing manage-python on Windows with Command Prompt"
-dcterms:version: "0.1.1"
+dcterms:version: "0.1.2"
 dc:creator: "Christopher Steel"
 dc:contributor: "Claude Opus 5.5 (Anthropic)"
 dc:description: "Step-by-step guide to downloading, verifying and installing osat-manager-python 1.0.2 on Windows 11 from Command Prompt, through to installing and switching to a second Python version."
@@ -16,10 +16,16 @@ dc:rights: >
   SPDX-License-Identifier: GPL-3.0-or-later
 sat:uuid: ""
 sat:repository: "osat-manager-python"
-sat:path: "en/docs/guides/"
+sat:path: "en/docs/guides/osat-manager-python/"
 sat:version_at_creation: "0.4.0"
 sat:migration_status: pre-sat
 sat:changelog:
+  - version: "0.1.2"
+    date: "2026-09-29"
+    author: "Christopher Steel"
+    notes: >
+      Moved from en/docs/guides/ to en/docs/guides/osat-manager-python/,
+      with sat:path updated to match. Content unchanged.
   - version: "0.1.1"
     date: "2026-09-29"
     author: "Christopher Steel"
@@ -39,7 +45,7 @@ sat:changelog:
 
 # Installing manage-python on Windows with Command Prompt
 
-Version: 0.1.1
+Version: 0.1.2
 Status: Draft
 Style Guide: style-guide--plain-language-for-general-audiences
 
@@ -290,5 +296,6 @@ This document, *Installing manage-python on Windows with Command Prompt*, by **C
 
 | Version | Status | Notes |
 |---------|--------|-------|
+| 0.1.2 | Draft | Moved from `en/docs/guides/` to `en/docs/guides/osat-manager-python/`, with `sat:path` updated to match; content unchanged |
 | 0.1.1 | Draft | Corrections from walking through the guide on Windows 11: telling Command Prompt from PowerShell, opening Command Prompt from the Start menu, PowerShell equivalents for the commands that differ, and a troubleshooting entry for "Get-FileHash is not recognized" in release 1.0.2 |
 | 0.1.0 | Draft | Initial guide, based on installing osat-manager-python 1.0.2 on a Windows 11 virtual machine from Command Prompt |

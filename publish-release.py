@@ -138,6 +138,28 @@ def refuse_unless_pushed(tag: str) -> None:
              f"push first:\n    git push && git push {REMOTE} {tag}")
 
 
+def refuse_if_ignored_files_tracked(tag: str) -> None:
+    """git archive packages every file tracked at the tag, and .gitignore
+    cannot remove a file that is already tracked: a file committed before
+    its ignore rule existed, or force-added, still ships. Refuse to package
+    any tracked file that matches the ignore rules of this checkout."""
+    listing = subprocess.run(["git", "ls-tree", "-r", "-z", "--name-only", tag],
+                             cwd=_HERE, capture_output=True)
+    if listing.returncode != 0:
+        fail(f"git ls-tree {tag} failed: {listing.stderr.decode().strip()}")
+    ignored = subprocess.run(["git", "check-ignore", "--no-index", "-z", "--stdin"],
+                             cwd=_HERE, input=listing.stdout, capture_output=True)
+    if ignored.returncode not in (0, 1):            # 1: nothing matched
+        fail(f"git check-ignore failed: {ignored.stderr.decode().strip()}")
+    names = [n for n in ignored.stdout.decode().split("\0") if n]
+    if names:
+        shown = "\n  ".join(names[:20]) + (f"\n  ... and {len(names) - 20} more"
+                                              if len(names) > 20 else "")
+        fail(f"{len(names)} file(s) tracked at {tag} match .gitignore and would be "
+             f"packaged:\n  {shown}\nStop tracking them with git rm -r --cached "
+             f"<path>, commit, then cut and publish a new release.")
+
+
 def remote_url() -> str:
     return git("remote", "get-url", REMOTE).strip()
 
@@ -348,6 +370,7 @@ def main() -> int:
 
     refuse_unless_tagged(tag, version)
     refuse_unless_pushed(tag)
+    refuse_if_ignored_files_tracked(tag)
 
     backend = detect_backend(args, repo, version)
     backend.preflight(tag)
