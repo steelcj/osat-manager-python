@@ -476,7 +476,7 @@ This document, *Installing manage-python from the Latest Release*, by **Christop
 ### osat-manager-python
 
 - [Proposal: osat-manager-python Layout, Lifecycle and Aliases](#apa-omp-proposal-reference)
-- [Installing manage-python on Windows with Command Prompt](installing-manage-python-on-windows-with-command-prompt-v0-1-2.md)
+- [Installing manage-python on Windows with Command Prompt](installing-manage-python-on-windows-with-command-prompt-v0.1.2.md)
 
 ### GitHub
 
