@@ -7,6 +7,10 @@ N` file and the git tags. Dates are ISO 8601.
 
 ## [Unreleased]
 
+### Added
+
+- Guide: Installing manage-python from the Latest Release 0.1.2, with 0.1.0 and 0.1.1 beside it
+
 ### Fixed
 
 - `install.ps1` failed with "Get-FileHash is not recognized" when Windows PowerShell 5.1 was started from a Command Prompt opened inside PowerShell 7: 5.1 inherits PowerShell 7's `PSModulePath` and cannot load `Get-FileHash`, a script-defined cmdlet. It now computes the SHA-256 with .NET. Found on the Windows 11 VM. Verified on the Windows 11 VM: `install.ps1` completed with PowerShell 7's module paths inherited, the Store install's among them.

@@ -2,6 +2,29 @@
 
 ## Open items
 
+### Bug 001
+
+One small manager bug turned up while testing. The refusal message prints a lone `.` line before `python3.14 -m venv .venv`. That's the Debian control-file convention for a blank line, but pip prints it literally. Removing it from the `EXTERNALLY_MANAGED` text in `manage-python.py` would clean up the message. I left it out of the guide's shortened output.
+
+#### Fix
+
+The fix is a one-line change to the `EXTERNALLY_MANAGED` string in `manage-python.py` (around line 1421): delete the ` .` line.
+
+```python
+EXTERNALLY_MANAGED = """[externally-managed]
+Error=This Python runtime is managed by manage-python and does not accept
+ package installs, so it stays intact for every virtual environment built on it.
+ Create a virtual environment and install into that instead:
+     python{minor} -m venv .venv
+"""
+```
+
+A unit test that reads the written `EXTERNALLY-MANAGED` file back with `configparser` could also check that no line of the `Error` value is only `.`. That would stop it from coming back. Once it's fixed, the shortened refusal output in the latest-release guide stays accurate as it is.
+
+### Translations
+
+In order to ensure that translations are working we should add fr-ca translations and perhaps spanish as well in order to ensure that everything is functioning as it should. This may be less important for geeky python people but more important over time as we add more universal cake metric features.
+
 ### osat-fluent variances
 
 #### install-<target>.py
